@@ -56,8 +56,14 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--mute
 .tab:first-child{border-radius:5px 0 0 5px}
 .tab:last-child{border-radius:0 5px 5px 0}
 .tab[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#fff}
-.controls select,.controls input[type="search"]{background:var(--panel);color:var(--text);border:1px solid var(--line2);border-radius:5px;padding:5px 7px;font-size:11px}
+.controls select,.controls input[type="search"],.controls input[type="number"],.scen input[type="number"]{background:var(--panel);color:var(--text);border:1px solid var(--line2);border-radius:5px;padding:5px 7px;font-size:11px}
 .controls input[type="search"]{min-width:150px}
+.scen input[type="number"]{width:90px}
+/* scenario slider row */
+.scen{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:8px;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:7px 10px;font-size:11px;color:var(--muted)}
+.scen-t{font-weight:700;color:var(--text)}
+.scen label{color:var(--muted)}
+.scen .sum{margin-left:auto}
 .controls .btn{border:1px solid var(--line2);background:var(--panel);color:var(--text);border-radius:5px;padding:5px 9px;font-size:11px;cursor:pointer}
 .controls .sum{margin-left:auto;font-size:11px;color:var(--muted)}
 /* ranking table */
@@ -79,6 +85,18 @@ table.board{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
 .vSKIP{color:var(--red);font-weight:700}
 .num{font-variant-numeric:tabular-nums}
 .muted{color:var(--muted)}
+.board .sub{color:var(--dim);font-size:10px}
+/* two-outcome + benchmark box in the drawer */
+.duo{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.duo>div{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:12px;line-height:1.5}
+.duo b{color:var(--accent2)}
+/* method tab */
+.method table{width:100%;border-collapse:collapse;font-size:11px;margin-top:4px}
+.method th,.method td{padding:2px 6px;border-bottom:1px solid var(--line);text-align:right}
+.method th:first-child,.method td:first-child{text-align:left}
+.method th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.05em}
+.scatter{width:100%;height:auto;background:var(--panel);border:1px solid var(--line);border-radius:6px;margin-top:4px}
+.scatter text{fill:var(--muted);font-size:10px}
 /* detail drawer */
 #drawer{position:fixed;top:0;right:0;bottom:0;width:440px;max-width:94vw;background:#0e1420;border-left:1px solid var(--line2);padding:16px;overflow-y:auto;z-index:20;box-shadow:-12px 0 32px rgba(0,0,0,.5)}
 #drawer h2{margin:0 0 2px;font-size:16px;text-transform:none;letter-spacing:0;color:var(--text)}
