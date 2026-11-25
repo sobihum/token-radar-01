@@ -6,13 +6,16 @@
 //          protocols with mcap_usd > 0. No category, growth or age term:
 //          every one of the 13 tested variants lost to size-only on
 //          leave-one-out (LOO x3.40), so none of them is kept.
-//   odds:  logistic regression P(has token) with an age x size
-//          interaction, fitted on all 758 protocols. Brier LOO 0.2254
-//          against a 0.248 base rate. The change_7d feature is clamped
-//          to [-60, +120] so the +4448% outlier (Shift DeFi) cannot
-//          drive a row's odds to zero; the clamp leaves Brier LOO
-//          unchanged at 0.2254. Odds are never raised by hand to look
-//          like the leader's 0.83-0.85: the gap is reported, not hidden.
+//   odds:  age-band shares P(has token) by no-token age, fitted on all
+//          758 protocols. v1 used a logistic regression (age x size
+//          interaction, Brier LOO 0.2254); blind validation on this
+//          snapshot (LOO + 10-fold, same population) beats it with
+//          plain band shares: Brier LOO 0.2105, 10-fold 0.2112. The
+//          rate in each band is the share of protocols in that band
+//          that already have a token. No hand-raising: the better
+//          Brier costs headline odds (top row 0.62 -> 0.48, young
+//          0.41 -> 0.26) and roughly halves the top implied values —
+//          reported, not hidden.
 //   farm:  EV = implied x drop_share x (capital / TVL); net = EV - gas;
 //          net/hour = net / 3.5h. Capital $2,000, drop share 7%, gas
 //          "high" (5 tx at the most expensive chain's high per-tx cost).
@@ -70,7 +73,10 @@ export interface BoardRow {
   age_days: number | null;
   watchlist: boolean;
   rank: number;
+  rank_lo: number;
+  rank_hi: number;
   token_odds: number;
+  token_odds_band: string;
   implied_if_launches_usd: number;
   implied_value_usd: number;
   implied_range_p25_usd: number;
@@ -101,6 +107,13 @@ export interface OddsDefinition {
   kept: boolean;
 }
 
+export interface LedgerGroup {
+  key: string;
+  label: string;
+  count: number;
+  tvl_usd: number;
+}
+
 export interface RadarData {
   model: {
     name: string;
@@ -120,9 +133,11 @@ export interface RadarData {
     ols_n: number;
     ols_r2: number;
     odds_beta: number[];
+    odds_bands: { label: string; lo_days: number | null; hi_days: number | null; n: number; rate: number }[];
     odds_med_age_days: number;
     odds_med_change: number;
   };
+  ledger: LedgerGroup[];
   totals: {
     protocols: number;
     board: number;
@@ -144,6 +159,14 @@ export interface RadarData {
     range_within_x3: number;
     range_p25_p75: number;
     range_p10_p90: number;
+    wf50_cov_p25_p75: number;
+    wf50_cov_p10_p90: number;
+    wf70_cov_p25_p75: number;
+    wf70_cov_p10_p90: number;
+    range_q25_log: number;
+    range_q75_log: number;
+    median_pred_actual: number;
+    top10_stable_pct: number;
     brier_odds_loo: number;
     brier_odds_in_sample: number;
     brier_base_rate: number;
@@ -226,17 +249,20 @@ export const PRICE_VARIANTS: PriceVariant[] = [
   { variant: 'isotonic', loo: 3.73, wf50: 3.1, wf70: 4.08, kept: false },
 ];
 
-// Odds-definition search (Kaggle K2, 25 Nov 2026). "top4_max" is the
-// highest odds among the four largest watchlist rows; "young_min" is the
-// lowest odds among Bittensor dTAO (56 days) and Nonce Capital (45 days),
-// the two youngest protocols above $250M TVL. Only the interaction
-// definition is kept: the with-category model scores the best Brier but
-// crushes young protocols to 0.07 (a cohort artefact — Risk Curators
-// are young as a category, not unlikely to launch), and the hazard
-// model scores worse than the base rate.
+// Odds-definition search (Kaggle K2, 25 Nov 2026, plus the v2 band
+// validation). "top4_max" is the highest odds among the four largest
+// watchlist rows; "young_min" is the lowest odds among Bittensor dTAO
+// (56 days) and Nonce Capital (45 days), the two youngest protocols
+// above $250M TVL. The band-shares row is the kept definition: its
+// Brier, top-4 and young numbers are recomputed every run in
+// buildRadar (they are 0 here only as placeholders). The logistic
+// interaction row is kept as a tested definition: its Brier is also
+// recomputed every run, its top-4 / young numbers are the recorded
+// values from the v1 fit.
 export const ODDS_DEFINITIONS: OddsDefinition[] = [
+  { definition: 'age_band_shares', brier_loo: 0, top4_max: 0, young_min: 0, kept: true },
   { definition: 'logistic_with_cat', brier_loo: 0.2135, top4_max: 0.57, young_min: 0.07, kept: false },
-  { definition: 'logistic_interaction', brier_loo: 0.2254, top4_max: 0.62, young_min: 0.41, kept: true },
+  { definition: 'logistic_interaction', brier_loo: 0.2254, top4_max: 0.62, young_min: 0.41, kept: false },
   { definition: 'logistic_no_cat', brier_loo: 0.227, top4_max: 0.6, young_min: 0.23, kept: false },
   { definition: 'empirical_bayes', brier_loo: 0.2483, top4_max: 0.57, young_min: 0.48, kept: false },
   { definition: 'hazard', brier_loo: 0.2643, top4_max: 0.69, young_min: 0.79, kept: false },
@@ -284,6 +310,18 @@ function quantile(sorted: number[], q: number): number {
   const lo = Math.floor(pos);
   const hi = Math.ceil(pos);
   return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+/** Deterministic PRNG (mulberry32) — the bootstrap must agree byte for byte across runs. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 /** The house rules, applied to every row — not just the watchlist. */
@@ -334,6 +372,53 @@ export function reconciliation(protocols: SnapshotProtocol[], watchlist: Set<str
       .map(([reason, count]) => ({ reason, count }))
       .sort((a, b) => b.count - a.count || (a.reason < b.reason ? -1 : 1)),
   };
+}
+
+/** The 10-group ledger: every protocol in the snapshot in exactly one
+ *  group, so the board can show that all 758 are accounted for. The
+ *  excluded groups follow the same precedence as reconciliation():
+ *  an excluded category first, then a versioned name, then an
+ *  exchange prefix, then a wrapped/staked/staking word. */
+export function ledgerGroups(protocols: SnapshotProtocol[], snapshot: Snapshot): LedgerGroup[] {
+  const watchlist = new Set(snapshot.watchlist);
+  const floor = snapshot.floor_usd;
+  const groups: LedgerGroup[] = [
+    { key: 'trades', label: 'Token trades', count: 0, tvl_usd: 0 },
+    { key: 'recorded', label: 'Token recorded, no usable cap', count: 0, tvl_usd: 0 },
+    { key: 'watchlist', label: 'Ranked · watchlist', count: 0, tvl_usd: 0 },
+    { key: 'offlist', label: 'Ranked · off-list, above floor', count: 0, tvl_usd: 0 },
+    { key: 'early', label: 'Ranked · early, below floor', count: 0, tvl_usd: 0 },
+    { key: 'bridge', label: 'Out · bridge', count: 0, tvl_usd: 0 },
+    { key: 'staking', label: 'Out · liquid staking', count: 0, tvl_usd: 0 },
+    { key: 'exchange', label: 'Out · exchange', count: 0, tvl_usd: 0 },
+    { key: 'versioned', label: 'Out · versioned', count: 0, tvl_usd: 0 },
+    { key: 'wrapped', label: 'Out · wrapped', count: 0, tvl_usd: 0 },
+  ];
+  const byKey = new Map(groups.map((g) => [g.key, g]));
+  const add = (key: string, p: SnapshotProtocol): void => {
+    const g = byKey.get(key) as LedgerGroup;
+    g.count += 1;
+    g.tvl_usd += p.tvl_usd;
+  };
+  for (const p of protocols) {
+    if (!isPreToken(p)) {
+      add(p.mcap_usd !== null && p.mcap_usd > 0 ? 'trades' : 'recorded', p);
+      continue;
+    }
+    if (isRankable(p)) {
+      if (watchlist.has(p.slug)) add('watchlist', p);
+      else if (p.tvl_usd >= floor) add('offlist', p);
+      else add('early', p);
+      continue;
+    }
+    if (p.category === 'Bridge' || p.category === 'Canonical Bridge') add('bridge', p);
+    else if (p.category === 'Liquid Staking' || p.category === 'Liquid Restaking' || p.category === 'Restaked BTC') add('staking', p);
+    else if (p.category === 'CEX' || EXCHANGE_PREFIXES.some((e) => p.name.startsWith(e))) add('exchange', p);
+    else if (VERSION_RE.test(p.name)) add('versioned', p);
+    else if (WORD_RE.test(p.name)) add('wrapped', p);
+    else add('wrapped', p);
+  }
+  return groups;
 }
 
 // --- Price model: log-log OLS on TVL only ----------------------------------
@@ -543,6 +628,67 @@ export function brierLoo(protocols: SnapshotProtocol[], fullBeta: number[]): num
   return sum / protocols.length;
 }
 
+// --- Token odds v2: age-band shares -----------------------------------------
+// The logistic above stays in the file as a tested definition (its Brier
+// is still recomputed every run for the odds table). The shipped odds
+// are the band shares: they win on both blind tests, and they are
+// transparent — every row's odds is the recorded token rate of
+// protocols its own age.
+
+export interface AgeBand { key: string; label: string; loDays: number; hiDays: number }
+export const AGE_BANDS: AgeBand[] = [
+  { key: 'lt6m', label: '<6mo', loDays: 0, hiDays: 182 },
+  { key: '6to12m', label: '6–12mo', loDays: 182, hiDays: 365 },
+  { key: '1to1.5y', label: '1–1.5y', loDays: 365, hiDays: 547 },
+  { key: '1.5to2y', label: '1.5–2y', loDays: 547, hiDays: 730 },
+  { key: '2to3y', label: '2–3y', loDays: 730, hiDays: 1095 },
+  { key: 'gte3y', label: '3y+', loDays: 1095, hiDays: Infinity },
+  { key: 'nodate', label: 'no date', loDays: -1, hiDays: -1 },
+];
+
+export function bandOf(p: SnapshotProtocol): AgeBand {
+  const ag = ageDays(p);
+  if (ag === null) return AGE_BANDS[6];
+  for (const b of AGE_BANDS) {
+    if (b.loDays >= 0 && ag >= b.loDays && ag < b.hiDays) return b;
+  }
+  return AGE_BANDS[5];
+}
+
+export interface BandShare { band: AgeBand; n: number; y1: number; rate: number }
+
+export function bandShares(protocols: SnapshotProtocol[]): BandShare[] {
+  const acc: BandShare[] = AGE_BANDS.map((band) => ({ band, n: 0, y1: 0, rate: 0 }));
+  for (const p of protocols) {
+    const a = acc.find((x) => x.band.key === bandOf(p).key) as BandShare;
+    a.n += 1;
+    if (!isPreToken(p)) a.y1 += 1;
+  }
+  for (const a of acc) a.rate = a.n === 0 ? 0 : a.y1 / a.n;
+  return acc;
+}
+
+export function bandOddsOf(p: SnapshotProtocol, bands: BandShare[]): number {
+  return (bands.find((a) => a.band.key === bandOf(p).key) as BandShare).rate;
+}
+
+/** Leave-one-out Brier for the band-shares odds (each row's band rate without itself). */
+export function brierLooBand(protocols: SnapshotProtocol[]): number {
+  const bands = bandShares(protocols);
+  const totalY1 = protocols.filter((p) => !isPreToken(p)).length;
+  let sum = 0;
+  for (let i = 0; i < protocols.length; i++) {
+    const p = protocols[i];
+    const b = bands.find((a) => a.band.key === bandOf(p).key) as BandShare;
+    const y = isPreToken(p) ? 0 : 1;
+    let pi: number;
+    if (b.n - 1 > 0) pi = (b.y1 - y) / (b.n - 1);
+    else pi = (totalY1 - y) / (protocols.length - 1);
+    sum += (y - pi) * (y - pi);
+  }
+  return sum / protocols.length;
+}
+
 // --- Implied value and farm economics --------------------------------------
 
 export function impliedIfLaunches(fit: OlsFit, tvlUsd: number): number {
@@ -655,11 +801,28 @@ export function buildRadar(snapshot: Snapshot, mainSha256: string): { board: Boa
   const range = rangeCalibration(loo.logErrs);
   const oddsFit = fitOdds(protocols);
   const brierOddsLoo = brierLoo(protocols, oddsFit.beta);
+  const bands = bandShares(protocols);
+  const bandBrierLoo = brierLooBand(protocols);
+
+  // Walk-forward honesty of the LOO intervals: how often the printed
+  // P25–P75 / P10–P90 bands actually covered walk-forward tokens.
+  // (The in-sample range_p25_p75 / range_p10_p90 are ~50% / ~80% by
+  // construction; these are the honest out-of-sample numbers.)
+  const wfCov = (wf: { preds: number[]; actuals: number[] } | null): [number, number] => {
+    if (!wf || wf.preds.length === 0) return [0, 0];
+    const errs = wf.preds.map((p, i) => Math.log((wf.actuals[i] as number) / p));
+    const in2575 = errs.filter((e) => e >= range.q25 && e <= range.q75).length / errs.length;
+    const in1090 = errs.filter((e) => e >= range.q10 && e <= range.q90).length / errs.length;
+    return [in2575, in1090];
+  };
+  const [wf50Cov2575, wf50Cov1090] = wfCov(wf50);
+  const [wf70Cov2575, wf70Cov1090] = wfCov(wf70);
+  const medianPredActual = Math.exp(-median(loo.logErrs));
 
   const boardRows = boardProtocols(protocols);
   const rows: BoardRow[] = boardRows.map((p) => {
     const v2 = impliedIfLaunches(fit, p.tvl_usd);
-    const odds = oddsOf(p, oddsFit.beta);
+    const odds = bandOddsOf(p, bands);
     const v3 = v2 * odds;
     const plan = farmPlan(p, v3);
     return {
@@ -672,7 +835,10 @@ export function buildRadar(snapshot: Snapshot, mainSha256: string): { board: Boa
       age_days: ageDays(p),
       watchlist: watchlist.has(p.slug),
       rank: 0,
+      rank_lo: 0,
+      rank_hi: 0,
       token_odds: odds,
+      token_odds_band: bandOf(p).label,
       implied_if_launches_usd: Math.round(v2),
       implied_value_usd: Math.max(1, Math.round(v3)),
       implied_range_p25_usd: Math.max(1, Math.round(v3 * Math.exp(range.q25))),
@@ -694,6 +860,40 @@ export function buildRadar(snapshot: Snapshot, mainSha256: string): { board: Boa
     b.tvl_usd - a.tvl_usd ||
     (a.slug < b.slug ? -1 : 1));
   rows.forEach((r, i) => { r.rank = i + 1; });
+
+  // Rank ranges: bootstrap the price fit (resample the calibration set,
+  // refit OLS, re-rank by the same key) and record each row's P10–P90
+  // rank. Odds are held fixed — the price fit is what moves ranks.
+  // Deterministic seed, so two runs agree byte for byte.
+  const BOOT_B = 200;
+  const rankSamples: number[][] = rows.map(() => []);
+  const rowIndex = new Map(rows.map((r, i) => [r.slug, i]));
+  const baseTop10 = new Set(rows.slice(0, 10).map((r) => r.slug));
+  let top10Stable = 0;
+  const rng = mulberry32(20261126);
+  for (let b = 0; b < BOOT_B; b++) {
+    const sample: SnapshotProtocol[] = [];
+    for (let i = 0; i < cal.length; i++) sample.push(cal[Math.floor(rng() * cal.length)] as SnapshotProtocol);
+    const bFit = olsLogLog(sample);
+    const scored = rows.map((r) => ({
+      slug: r.slug,
+      tvl: r.tvl_usd,
+      v: Math.max(1, Math.round(Math.exp(bFit.intercept) * Math.pow(r.tvl_usd, bFit.slope) * r.token_odds)),
+    }));
+    scored.sort((a, b2) => b2.v - a.v || b2.tvl - a.tvl || (a.slug < b2.slug ? -1 : 1));
+    scored.forEach((s, i) => { (rankSamples[rowIndex.get(s.slug) as number] as number[]).push(i + 1); });
+    const top10 = new Set(scored.slice(0, 10).map((s) => s.slug));
+    if ([...baseTop10].every((s) => top10.has(s))) top10Stable += 1;
+  }
+  rows.forEach((r, i) => {
+    const s = [...(rankSamples[i] as number[])].sort((a, b) => a - b);
+    // The P10–P90 interval is widened to contain the point rank: the
+    // bootstrap distribution can sit slightly off the full-fit rank
+    // (resampling bias), and a range that excludes its own rank is nonsense.
+    r.rank_lo = Math.max(1, Math.min(Math.round(quantile(s, 0.1)), r.rank));
+    r.rank_hi = Math.min(rows.length, Math.max(Math.round(quantile(s, 0.9)), r.rank));
+  });
+  const top10StablePct = top10Stable / BOOT_B;
 
   const rec = reconciliation(protocols, watchlist);
   // The Live list shows the token-bearing protocols that actually
@@ -719,11 +919,29 @@ export function buildRadar(snapshot: Snapshot, mainSha256: string): { board: Boa
   const bittensor = bySlug.get('bittensor-dtao');
   const nonce = bySlug.get('nonce-capital');
 
+  // Odds-table numbers for the two live definitions, recomputed here.
+  const protoBySlug = new Map(protocols.map((p) => [p.slug, p]));
+  const top4Watch = [...rows].filter((r) => r.watchlist).sort((a, b) => b.tvl_usd - a.tvl_usd).slice(0, 4);
+  const bandTop4 = Math.max(...top4Watch.map((r) => r.token_odds));
+  const bandYoung = Math.min(bittensor ? bittensor.token_odds : 1, nonce ? nonce.token_odds : 1);
+  const logTop4 = Math.max(...top4Watch.map((r) => oddsOf(protoBySlug.get(r.slug) as SnapshotProtocol, oddsFit.beta)));
+  const bitProto = protoBySlug.get('bittensor-dtao');
+  const nonceProto = protoBySlug.get('nonce-capital');
+  const logYoung = Math.min(
+    bitProto ? oddsOf(bitProto, oddsFit.beta) : 1,
+    nonceProto ? oddsOf(nonceProto, oddsFit.beta) : 1,
+  );
+  const oddsDefinitions = ODDS_DEFINITIONS.map((d) => {
+    if (d.definition === 'age_band_shares') return { ...d, brier_loo: bandBrierLoo, top4_max: bandTop4, young_min: bandYoung };
+    if (d.definition === 'logistic_interaction') return { ...d, brier_loo: brierOddsLoo, top4_max: logTop4, young_min: logYoung };
+    return d;
+  });
+
   const radar: RadarData = {
     model: {
-      name: 'radar-v1',
+      name: 'radar-v2',
       price: 'log-log OLS, TVL only',
-      odds: 'logistic, age x size interaction',
+      odds: 'age-band shares (7 bands)',
       as_of: snapshot.as_of,
       source: snapshot.source,
       floor_usd: snapshot.floor_usd,
@@ -738,6 +956,13 @@ export function buildRadar(snapshot: Snapshot, mainSha256: string): { board: Boa
       ols_n: fit.n,
       ols_r2: fit.r2,
       odds_beta: oddsFit.beta,
+      odds_bands: bands.map((a) => ({
+        label: a.band.label,
+        lo_days: a.band.loDays < 0 ? null : a.band.loDays,
+        hi_days: a.band.hiDays === Infinity ? null : a.band.hiDays,
+        n: a.n,
+        rate: a.rate,
+      })),
       odds_med_age_days: MED_AGE_DAYS,
       odds_med_change: MED_CHANGE,
     },
@@ -762,7 +987,15 @@ export function buildRadar(snapshot: Snapshot, mainSha256: string): { board: Boa
       range_within_x3: range.withinX3,
       range_p25_p75: range.withinP25P75,
       range_p10_p90: range.withinP10P90,
-      brier_odds_loo: brierOddsLoo,
+      wf50_cov_p25_p75: wf50Cov2575,
+      wf50_cov_p10_p90: wf50Cov1090,
+      wf70_cov_p25_p75: wf70Cov2575,
+      wf70_cov_p10_p90: wf70Cov1090,
+      range_q25_log: range.q25,
+      range_q75_log: range.q75,
+      median_pred_actual: medianPredActual,
+      top10_stable_pct: top10StablePct,
+      brier_odds_loo: bandBrierLoo,
       brier_odds_in_sample: oddsFit.brierInSample,
       brier_base_rate: oddsFit.baseRate * (1 - oddsFit.baseRate),
       top_row_odds: topRow ? topRow.token_odds : 0,
@@ -774,7 +1007,8 @@ export function buildRadar(snapshot: Snapshot, mainSha256: string): { board: Boa
       odds_definitions_kept: ODDS_DEFINITIONS.filter((v) => v.kept).length,
     },
     price_variants: PRICE_VARIANTS,
-    odds_definitions: ODDS_DEFINITIONS,
+    odds_definitions: oddsDefinitions,
+    ledger: ledgerGroups(protocols, snapshot),
     accounting: {
       segments: [
         { key: 'ranked', label: 'Ranked pre-token', count: rec.board, tvl_usd: rows.reduce((s, r) => s + r.tvl_usd, 0) },
