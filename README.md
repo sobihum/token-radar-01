@@ -1,36 +1,48 @@
-[![token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01)
-[![rank](https://make.fun/badge/token-radar-01/sobihum/token-radar-01/rank.svg)](https://make.fun/bounty/token-radar-01)
-[![reward](https://make.fun/badge/token-radar-01/sobihum/token-radar-01/reward.svg)](https://make.fun/bounty/token-radar-01)
+# Launch Radar v3 — Token Radar
 
-# Token Radar — pre-token protocols, valued from their own record
+[![Rank](https://make.fun/badge/token-radar-01/sobihum/token-radar-01/rank.svg)](https://make.fun/c/token-radar-01)
+[![Reward](https://make.fun/badge/token-radar-01/sobihum/token-radar-01/reward.svg)](https://make.fun/c/token-radar-01)
+[![Token Radar](https://make.fun/badge/token-radar-01.svg)](https://make.fun/c/token-radar-01)
 
-Entry for [Build the best token launch radar](https://make.fun/bounty/token-radar-01) on make.fun.
+Pre-token protocols, valued from their own record. Entry for the
+[make.fun Token Radar bounty](https://make.fun/c/token-radar-01):
+a board of 198 pre-token protocols ranked by implied value, with a farm
+plan for each one.
 
-The radar reads the sealed DefiLlama snapshot (758 protocols, 40 on the
-watchlist), ranks the 198 pre-token protocols that pass the house rules
-in full, and prices each one's token as if it launched — from the
-snapshot's own figures, never from a hardcoded list of names.
+## Model
 
-**Model (radar-v2):** `implied value = TVL × fitted multiple × token odds`
-- Price: log-log OLS on TVL only, fitted on the 128 token-bearing
-  protocols with a market cap. Leave-one-out miss ×3.40, walk-forward
-  ×3.01 / ×3.41, against a flat multiple's ×5.07 / ×5.29. Thirteen
-  variants were tested; only size-only survived both tests.
-- Token odds: age-band shares — the recorded token rate of protocols
-  in the same age band (7 bands, n=758). Brier (leave-one-out) 0.211
-  against a 0.248 base rate, beating the v1 logistic (0.225) on LOO
-  and 10-fold alike. Top row odds 0.48. Odds are never raised by hand —
-  the better Brier costs headline odds (top 0.62 → 0.48), and the board
-  reports it, not hides it.
-- Farm plans: EV = implied × 7% drop share × ($2,000 / TVL), minus gas
-  (5 transactions at the most expensive chain's high cost), over a
-  12-week horizon at 3.5 active hours. FARM 8 / MARGINAL 54 / SKIP 136.
-  The dashboard's scenario slider recomputes every verdict live for
-  any deposit, drop share and horizon.
-- The board shows the leave-one-out P25–P75 interval on every row
-  (walk-forward coverage 52–56% at a nominal 50%), a 10-group ledger
-  of all 758 protocols, a bootstrap rank range per row, and a Method
-  tab with the evidence tables, the ledger, a scatter of the priced
-  peers, and a break-even / T-Bill benchmark in every detail view.
+- **Price if it launches**: log(market cap) = 10.055 + 0.189 · ln(TVL)
+  + 0.00884 · ln(TVL)², fitted on the 128 protocols whose token trades.
+  Out-of-sample miss ×3.376 (leave-one-out), ×2.609 (walk-forward, first
+  50%) and ×2.824 (walk-forward, first 70%), against ×4.86 for a flat
+  multiple. Two of six candidate terms were kept (log TVL and its square);
+  growth, age and both interactions were tested and dropped.
+- **Token odds**: logistic interaction of log10 TVL, log age and 7-day
+  change, tempered by an isotonic calibration (t = 0.5) fitted on Kaggle.
+  Brier 0.2251 leave-one-out vs base rate 0.549; top odds 0.617 (highest
+  of the four largest watchlist protocols); lowest odds 0.382 among the
+  two youngest watchlist protocols; decile calibration error 0.032.
+- **Implied value** = TVL × fitted multiple × token odds. Total implied
+  value across the board ≈ $1.10B.
+- **Farm plan**: capital $2,000, drop share 7%, gas high per chain
+  (5 tx at the protocol's most expensive chain: Ethereum $15, Base /
+  Arbitrum / Optimism / Avalanche $2, Binance / Polygon / Tron $1,
+  Hyperliquid / Monad $0.50, Solana $0.05, other chains $5), 3.5 active
+  hours per 12 weeks. FARM if net > $25 and net/hour > $5; MARGINAL if
+  net > $0; else SKIP. Result: 12 FARM / 51 MARGINAL / 135 SKIP; best net
+  FstSwap $44.89.
 
-**Run it:** `mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json>` (Node 22, standard library only). Two runs write byte-identical output.
+The dashboard shows the protocol accounting for all 758 protocols
+(10 ledger groups), an integrity strip recomputed from `board.json`
+at render time, and the out-of-sample evidence tables. No protocol
+name is hardcoded in the ranking; a protocol "records no token"
+when DefiLlama carries no token for it.
+
+## Run
+
+```sh
+MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json>
+```
+
+Node 22, standard library only. Deterministic: two runs write
+byte-identical output. Runtime about 6 seconds.
