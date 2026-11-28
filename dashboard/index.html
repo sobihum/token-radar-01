@@ -1,16 +1,89 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Radar: pre-token protocols, valued from their own record</title>
+<title>Launch Radar — pre-token protocols, valued from their own record</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
-<a class="skip" href="#board">Skip to the board</a>
-<main id="board" tabindex="-1" aria-busy="true"></main>
-<aside id="drawer" aria-label="Protocol detail" hidden></aside>
-<script src="../data.js"></script>
+<header class="top">
+  <div>
+    <h1>Launch Radar</h1>
+    <p class="sub">Pre-token protocols, valued from their own record. Snapshot as of 2026-11-14, source DefiLlama. "Records no token" is not a claim it has none.</p>
+  </div>
+  <div class="topright"><span class="dot"></span><span id="asof"></span></div>
+</header>
+
+<section id="kpis" class="kpis" aria-label="Key figures"></section>
+
+<p class="formula">Implied value = TVL &times; fitted multiple &times; token odds <span id="formulaNums"></span></p>
+
+<section class="panel" id="accounting">
+  <h2>Protocol accounting — all 758 protocols, each exactly once</h2>
+  <div id="ledgerBar" class="ledgerbar"></div>
+  <div id="ledgerTable" class="ledger"></div>
+</section>
+
+<section class="panel" id="integrityPanel">
+  <h2>Integrity — recomputed from board.json when this page renders</h2>
+  <ul id="integrity" class="checks"></ul>
+</section>
+
+<section class="panel" id="evidence">
+  <h2>Out-of-sample evidence — every term kept only if it passes two held-out tests</h2>
+  <div class="evgrid">
+    <div><h3>Value if it launches — miss (median &times;)</h3><div id="evPrice"></div></div>
+    <div><h3>Token odds — calibration by decile</h3><div id="evOdds"></div></div>
+    <div><h3>Range honesty — LOO intervals</h3><div id="evRange"></div></div>
+  </div>
+  <p class="fine" id="modelNote"></p>
+</section>
+
+<section class="panel" id="controls">
+  <h2>Board — 198 ranked protocols</h2>
+  <div class="ctl">
+    <label>Verdict <select id="fVerdict"><option value="">All</option><option>FARM</option><option>MARGINAL</option><option>SKIP</option></select></label>
+    <label>List <select id="fList"><option value="">All</option><option value="wl">Watchlist</option><option value="early">Early (off-list)</option></select></label>
+    <label>Category <select id="fCat"><option value="">All</option></select></label>
+    <label>Chain <select id="fChain"><option value="">All</option></select></label>
+    <label>Search <input id="fSearch" type="search" placeholder="protocol name"></label>
+    <button id="resetBtn" type="button">Reset</button>
+    <button id="csvBtn" type="button">Export CSV</button>
+    <button id="jsonBtn" type="button">Export JSON</button>
+  </div>
+  <div class="ctl sliders">
+    <label>Plan size <input id="sCap" type="range" min="500" max="20000" step="500" value="2000"> <b id="sCapV">$2,000</b></label>
+    <label>Drop share <input id="sDrop" type="range" min="1" max="20" step="1" value="7"> <b id="sDropV">7%</b></label>
+    <label>Horizon <input id="sHor" type="range" min="4" max="52" step="4" value="12"> <b id="sHorV">12 weeks</b></label>
+    <span class="fine" id="farmAssump"></span>
+  </div>
+  <p class="fine" id="rowCount"></p>
+  <div class="tablewrap"><table id="board">
+    <thead><tr>
+      <th data-k="0">#</th><th data-k="1">Protocol</th><th data-k="2">Category</th><th data-k="3">Chain</th>
+      <th data-k="4">TVL</th><th data-k="5">7d</th><th data-k="6">Age</th><th data-k="7">Token odds</th>
+      <th data-k="8">Implied value</th><th data-k="9">Range P25–P75</th><th data-k="10">Farm verdict</th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+  </table></div>
+</section>
+
+<section class="panel" id="detailPanel">
+  <h2>Protocol detail</h2>
+  <div id="detail"><p class="fine">Click a row in the board to see its full record, intervals and farm plan.</p></div>
+</section>
+
+<footer>
+  <h2>Honesty notes</h2>
+  <ul>
+    <li>Ranks below the top two are noisy: intervals are shown, never claim rank precision.</li>
+    <li>Token odds are a fitted result, not a promise that a token launches.</li>
+    <li>A farm verdict is a statement about the stated farmer profile (capital, drop share, gas), not a fact.</li>
+    <li>Implied value follows the snapshot's own figures — TVL, 7-day growth and time running with no token recorded — never a hardcoded list of names.</li>
+  </ul>
+</footer>
+<script src="data.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
