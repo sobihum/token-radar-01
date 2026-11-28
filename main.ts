@@ -1,367 +1,501 @@
-// Launch Radar v3 — main.ts (Node 22, stdlib only).
-// Reads the sealed DefiLlama snapshot, fits a price model and a token-odds model
-// from the snapshot's own figures, ranks the pre-token protocols by implied value,
-// writes board.json + data.js + dashboard + screenshots + dossier.json.
-// Deterministic: no clock, no randomness, no network.
-import { readFileSync, writeFileSync, mkdirSync, cpSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { buildDossier } from "./vendor/makefun-board.ts";
+// Launch Radar v4 — main.ts
+// Reads the sealed DefiLlama snapshot, ranks every pre-token protocol the house
+// rules leave in, and writes board.json, the dashboard data, and dossier.json.
+// Node 22, standard library only. Fully deterministic: no clock, no network,
+// no unseeded randomness. Run: node main.ts --input <snapshot.json>
+// Output directory: MAKEFUN_OUTPUT_DIR, default ./out
+import { createHash } from 'node:crypto';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { buildDossier } from './vendor/makefun-board.ts';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
-const OUT = process.env.MAKEFUN_OUTPUT_DIR || join(ROOT, "out");
-let inputPath = "/input/snapshot.json";
-for (let i = 2; i < process.argv.length; i++) {
-  if (process.argv[i] === "--input" && i + 1 < process.argv.length) inputPath = process.argv[++i];
-}
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const started = Date.now();
 
-// ---------- small numeric helpers (deterministic) ----------
-const ln = Math.log, exp = Math.exp;
-function median(a: number[]): number {
-  const s = [...a].sort((x, y) => x - y);
-  const n = s.length;
-  return n % 2 === 1 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+// ------------------------------------------------------------------ small tools
+const sha256 = (b: Buffer | string): string => createHash('sha256').update(b).digest('hex');
+const r3 = (x: number): number => Math.round(x * 1000) / 1000;
+const r4 = (x: number): number => Math.round(x * 10000) / 10000;
+const clamp = (x: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, x));
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
-function quantile(sorted: number[], p: number): number {
-  const n = sorted.length;
-  return sorted[Math.min(n - 1, Math.max(0, Math.floor(p * (n - 1))))];
-}
+// Solve Ax=b by Gaussian elimination with partial pivoting (small dense systems).
 function solve(A: number[][], b: number[]): number[] {
-  const n = A.length;
+  const n = b.length;
   const M = A.map((row, i) => [...row, b[i]]);
   for (let c = 0; c < n; c++) {
-    let piv = c;
-    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
-    [M[c], M[piv]] = [M[piv], M[c]];
-    for (let r = 0; r < n; r++) {
-      if (r === c) continue;
-      const f = M[r][c] / M[c][c];
+    let p = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    [M[c], M[p]] = [M[p], M[c]];
+    const d = M[c][c];
+    for (let r = c + 1; r < n; r++) {
+      const f = M[r][c] / d;
       for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k];
     }
   }
-  return M.map((row, i) => row[n] / row[i]);
+  const x = new Array<number>(n).fill(0);
+  for (let r = n - 1; r >= 0; r--) {
+    let s = M[r][n];
+    for (let k = r + 1; k < n; k++) s -= M[r][k] * x[k];
+    x[r] = s / M[r][r];
+  }
+  return x;
 }
 function ols(X: number[][], y: number[]): number[] {
-  const k = X[0].length;
-  const A: number[][] = Array.from({ length: k }, () => new Array(k).fill(0));
-  const b: number[] = new Array(k).fill(0);
-  for (let r = 0; r < X.length; r++) {
-    for (let i = 0; i < k; i++) {
-      b[i] += X[r][i] * y[r];
-      for (let j = 0; j < k; j++) A[i][j] += X[r][i] * X[r][j];
+  const p = X[0].length;
+  const XtX: number[][] = Array.from({ length: p }, () => new Array<number>(p).fill(0));
+  const Xty = new Array<number>(p).fill(0);
+  for (let i = 0; i < X.length; i++) {
+    for (let a = 0; a < p; a++) {
+      Xty[a] += X[i][a] * y[i];
+      for (let b = 0; b < p; b++) XtX[a][b] += X[i][a] * X[i][b];
     }
   }
-  for (let i = 0; i < k; i++) A[i][i] += 1e-8;
-  return solve(A, b);
+  return solve(XtX, Xty);
 }
-function dot(w: number[], x: number[]): number {
-  let s = 0;
-  for (let i = 0; i < w.length; i++) s += w[i] * x[i];
-  return s;
+function quantile(sorted: number[], q: number): number {
+  const n = sorted.length;
+  const pos = q * (n - 1);
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
 }
-function sigmoid(z: number): number {
-  const c = Math.max(-30, Math.min(30, z));
-  return 1 / (1 + exp(-c));
-}
-function fitLogistic(X: number[][], y: number[], w0: number[], iters: number, lr: number): number[] {
-  const w = [...w0];
-  const n = X.length;
-  const k = w.length;
-  for (let it = 0; it < iters; it++) {
-    const g = new Array(k).fill(0);
-    for (let r = 0; r < n; r++) {
-      const p = sigmoid(dot(w, X[r]));
-      const d = p - y[r];
-      for (let j = 0; j < k; j++) g[j] += d * X[r][j];
-    }
-    for (let j = 0; j < k; j++) w[j] -= (lr * g[j]) / n;
-  }
-  return w;
-}
+const median = (a: number[]): number => quantile([...a].sort((x, y) => x - y), 0.5);
+const mean = (a: number[]): number => a.reduce((s, x) => s + x, 0) / a.length;
+const pstdev = (a: number[], m: number): number => Math.sqrt(a.reduce((s, x) => s + (x - m) * (x - m), 0) / a.length);
 
-// ---------- snapshot ----------
+// ------------------------------------------------------------------ inputs
+const argv = process.argv.slice(2);
+let inputPath = '/input/snapshot.json';
+for (let i = 0; i < argv.length; i++) if (argv[i] === '--input' && argv[i + 1]) inputPath = argv[i + 1];
+const outDir = resolve(process.env.MAKEFUN_OUTPUT_DIR || './out');
+const snap = JSON.parse(readFileSync(resolve(inputPath), 'utf8'));
+const AS_OF = snap.as_of as string; // "2026-11-14"
+const FLOOR = snap.floor_usd as number;
+const asOfDay = Date.parse(AS_OF + 'T00:00:00Z');
+
 interface Proto {
-  slug: string; name: string; category: string | null; chains: string[];
+  slug: string; name: string; category: string; chains: string[];
   tvl_usd: number; change_7d: number | null; mcap_usd: number | null;
   listed_at: string | null; gecko_id: string | null; symbol: string | null;
 }
-const snap = JSON.parse(readFileSync(inputPath, "utf8")) as {
-  as_of: string; floor_usd: number; protocols: Proto[]; watchlist: string[];
-};
-const asOf = new Date(snap.as_of + "T00:00:00Z").getTime();
-const FLOOR = snap.floor_usd;
-const watchSet = new Set(snap.watchlist);
-function ageYears(p: Proto): number {
-  if (!p.listed_at) return 2.0; // median-ish fallback for unlisted protocols
-  const t = new Date(p.listed_at + "T00:00:00Z").getTime();
-  return (asOf - t) / (365.25 * 86400000);
-}
-const hasToken = (p: Proto) => p.gecko_id !== null || p.symbol !== null;
-const preToken = (p: Proto) => p.gecko_id === null && p.symbol === null && p.mcap_usd === null;
+const prots = snap.protocols as Proto[];
+const watchlist = new Set<string>(snap.watchlist as string[]);
+const N = prots.length;
 
-// ---------- exclusion (house rule, precedence: category, versioned, exchange, wrapped) ----------
-const EXCH = ["Binance", "Coinbase", "Bybit", "Kraken", "Bitget", "OKX", "Bitfinex", "Gemini"];
-const VER_RE = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
-const WRAP_RE = /\b(wrapped|staked|staking)\b/i;
-function exclusion(p: Proto): string | null {
-  const c = p.category;
-  if (c === "Bridge" || c === "Canonical Bridge") return "Bridge";
-  if (c === "Liquid Staking" || c === "Liquid Restaking" || c === "Restaked BTC") return "Liquid staking";
-  if (c === "CEX") return "Exchange";
-  if (VER_RE.test(p.name)) return "Versioned";
-  if (EXCH.some((e) => p.name.startsWith(e))) return "Exchange";
-  if (WRAP_RE.test(p.name)) return "Wrapped";
+function ageDays(p: Proto): number {
+  if (!p.listed_at) return 677;
+  const d = Math.round((asOfDay - Date.parse(p.listed_at + 'T00:00:00Z')) / 86400000);
+  return Math.max(0, d);
+}
+const hasToken = (p: Proto): boolean => p.gecko_id !== null || p.symbol !== null || p.mcap_usd !== null;
+const isPre = (p: Proto): boolean => p.gecko_id === null && p.symbol === null && p.mcap_usd === null;
+
+// House exclusion groups, category first, then versioned, then exchange prefix,
+// then wrapped-word. Each protocol lands in exactly one group.
+const EXCHANGES = ['Binance', 'Coinbase', 'Bybit', 'Kraken', 'Bitget', 'OKX', 'Bitfinex', 'Gemini'];
+function exclGroup(p: Proto): string | null {
+  const c = p.category; const n = p.name;
+  if (c === 'Bridge' || c === 'Canonical Bridge') return 'Bridge';
+  if (c === 'Liquid Staking' || c === 'Liquid Restaking' || c === 'Restaked BTC') return 'Liquid staking';
+  if (c === 'CEX') return 'Exchange';
+  if (/\s[Vv]\d+$/.test(n) || /\s\d+\.\d+$/.test(n)) return 'Versioned';
+  for (const e of EXCHANGES) if (n.startsWith(e)) return 'Exchange';
+  if (/\b(wrapped|staked|staking)\b/i.test(n)) return 'Wrapped';
   return null;
 }
 
-// ---------- price model: log-log OLS on the 128 protocols whose token trades ----------
-const calib = snap.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0);
-function priceFeats(p: Proto, spec: string): number[] {
-  const lt = ln(p.tvl_usd);
-  const g = (p.change_7d === null ? 0 : p.change_7d) / 10;
-  const ag = ageYears(p);
-  if (spec === "flat") return [1];
-  if (spec === "base") return [1, lt];
-  if (spec === "quad") return [1, lt, lt * lt];
-  if (spec === "+growth") return [1, lt, g];
-  if (spec === "+age") return [1, lt, ag];
-  if (spec === "+growth+age") return [1, lt, g, ag];
-  throw new Error("unknown spec " + spec);
-}
-function missOf(res: number[]): number {
-  return exp(median(res.map((r) => Math.abs(r))));
-}
-const SPECS = ["flat", "base", "+growth", "+age", "+growth+age", "quad"];
-// LOO miss per spec
-const looMiss: Record<string, number> = {};
-const looResidBySpec: Record<string, number[]> = {};
-for (const spec of SPECS) {
-  const X = calib.map((p) => priceFeats(p, spec));
-  const y = calib.map((p) => ln(p.mcap_usd!));
-  const res: number[] = [];
-  for (let i = 0; i < calib.length; i++) {
-    const w = ols(X.filter((_, j) => j !== i), y.filter((_, j) => j !== i));
-    res.push(y[i] - dot(w, X[i]));
-  }
-  looMiss[spec] = missOf(res);
-  looResidBySpec[spec] = res;
-}
-// Walk-forward: dated calibration protocols, earliest half trains, rest tests
-const dated = [...calib].filter((p) => p.listed_at !== null).sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : 1));
-const wfTrain = dated.slice(0, Math.floor(dated.length / 2));
-const wfTest = dated.slice(Math.floor(dated.length / 2));
-const wfMiss: Record<string, number> = {};
-for (const spec of SPECS) {
-  const w = ols(wfTrain.map((p) => priceFeats(p, spec)), wfTrain.map((p) => ln(p.mcap_usd!)));
-  wfMiss[spec] = missOf(wfTest.map((p) => ln(p.mcap_usd!) - dot(w, priceFeats(p, spec))));
-}
-// A term is kept only if adding it to the base beats the base on BOTH held-out
-// tests; the adopted price model is the best kept spec (log TVL only, here).
-const keptSpecs = SPECS.filter((s) => s !== "flat" && looMiss[s] <= looMiss.base + 1e-9 && wfMiss[s] <= wfMiss.base + 1e-9);
-const priceSpec = keptSpecs.sort((a, b) => looMiss[a] + wfMiss[a] - (looMiss[b] + wfMiss[b]))[0];
-const looResidBase = looResidBySpec[priceSpec];
-const priceW = ols(calib.map((p) => priceFeats(p, priceSpec)), calib.map((p) => ln(p.mcap_usd!)));
-const flatMult = median(calib.map((p) => p.mcap_usd! / p.tvl_usd));
-const flatMiss = missOf(calib.map((p) => ln(p.mcap_usd!) - ln(flatMult * p.tvl_usd)));
-const wfFlatMult = median(wfTrain.map((p) => p.mcap_usd! / p.tvl_usd));
-const wfFlatMiss = missOf(wfTest.map((p) => ln(p.mcap_usd!) - ln(wfFlatMult * p.tvl_usd)));
-const sortedResid = [...looResidBase].sort((a, b) => a - b);
-const Q10 = quantile(sortedResid, 0.1), Q25 = quantile(sortedResid, 0.25);
-const Q75 = quantile(sortedResid, 0.75), Q90 = quantile(sortedResid, 0.9);
-const inX3 = looResidBase.filter((r) => Math.abs(r) <= ln(3)).length / looResidBase.length;
-const in2575 = looResidBase.filter((r) => r >= Q25 && r <= Q75).length / looResidBase.length;
-const in1090 = looResidBase.filter((r) => r >= Q10 && r <= Q90).length / looResidBase.length;
-function fittedMcap(p: Proto): number {
-  return exp(dot(priceW, priceFeats(p, priceSpec)));
-}
-
-// ---------- token odds: interaction logistic + tempered isotonic (Kaggle K8) ----------
-// Frozen offline fit from Kaggle (radar-k8-odds-v3): an interaction logistic
-// on all 758 protocols, then an isotonic calibration tempered 50/50 with the
-// raw score. Leave-one-out Brier 0.2251, top odds 0.617, two youngest
-// protocols' lowest odds 0.382, decile calibration error 0.032. Nothing is refit here.
-const SNAP_DAY_MS = Date.parse("2026-11-14T00:00:00Z");
-const MED_AGE_DAYS = 677.0;
-const MED_CHG7D = -8.23335;
-function ageDays(p: Proto): number {
-  const la: unknown = (p as { listed_at?: unknown }).listed_at;
-  if (la === null || la === undefined) return MED_AGE_DAYS;
-  const t = typeof la === "number" ? (la < 1e12 ? la * 1000 : la) : Date.parse(String(la));
-  if (!Number.isFinite(t)) return MED_AGE_DAYS;
-  return (SNAP_DAY_MS - t) / 86400000;
-}
-const ODD_BETA = [-20.94353469876965, 2.2390161109072815, 22.01291562492974, -1.515024554597611, -2.3111045361822593];
-const ISO_X = [0, 0.0097, 0.0289, 0.031, 0.3694, 0.3715, 0.3841, 0.4505, 0.5247, 0.5297, 0.533, 0.5341, 0.5408, 0.5716, 0.6077, 0.636, 0.662, 0.6714, 0.7175, 0.7928];
-const ISO_Y = [0, 0, 0, 0.234, 0.25, 0.3333, 0.3514, 0.3649, 0.375, 0.4, 0.5, 0.5, 0.56, 0.6087, 0.61, 0.6349, 0.7647, 0.7763, 0.8696, 1.0];
-function oddsFeats(p: Proto): number[] {
-  const lt10 = Math.log10(p.tvl_usd);
-  const la = Math.log1p(ageDays(p)) / Math.log1p(1095);
-  const ch = (p.change_7d === null || p.change_7d === undefined ? MED_CHG7D : p.change_7d) / 100;
-  return [1, lt10, la, ch, la * lt10];
-}
-function isoMap(x: number): number {
-  if (x <= ISO_X[0]) return ISO_Y[0];
-  for (let i = 1; i < ISO_X.length; i++) {
-    if (x <= ISO_X[i]) {
-      const f = (x - ISO_X[i - 1]) / (ISO_X[i] - ISO_X[i - 1]);
-      return ISO_Y[i - 1] + f * (ISO_Y[i] - ISO_Y[i - 1]);
-    }
-  }
-  return ISO_Y[ISO_Y.length - 1];
-}
-function oddsOf(p: Proto): number {
-  const raw = sigmoid(dot(ODD_BETA, oddsFeats(p)));
-  return 0.5 * isoMap(raw) + 0.5 * raw;
-}
-const YO = snap.protocols.map((p) => (hasToken(p) ? 1 : 0));
-const baseRate = YO.reduce((s, y) => s + y, 0) / YO.length;
-// Brier score measured leave-one-out on Kaggle (K8) on this same snapshot;
-// a per-fold refit is not possible for a tempered calibration fitted
-// offline, so the Kaggle figure is reported as a constant. Decile, top and
-// youngest odds below are computed at runtime from the final odds.
-const brierLoo = 0.2251;
-// deciles of predicted odds over all 758
-const allPred = snap.protocols.map((p) => ({ pr: oddsOf(p), y: hasToken(p) ? 1 : 0 })).sort((a, b) => a.pr - b.pr);
-const deciles: [number, number, number, number, number][] = [];
-for (let d = 0; d < 10; d++) {
-  const g = allPred.slice(Math.floor((d * allPred.length) / 10), Math.floor(((d + 1) * allPred.length) / 10));
-  deciles.push([g[0].pr, g[g.length - 1].pr, g.reduce((s, x) => s + x.pr, 0) / g.length, g.reduce((s, x) => s + x.y, 0) / g.length, g.length]);
-}
-const watchlist = snap.protocols.filter((p) => watchSet.has(p.slug));
-const biggestFour = [...watchlist].sort((a, b) => b.tvl_usd - a.tvl_usd).slice(0, 4);
-const topOdds = Math.max(...biggestFour.map(oddsOf));
-const youngWatch = [...watchlist].sort((a, b) => ageYears(a) - ageYears(b)).slice(0, 2);
-const youngOdds = Math.min(...youngWatch.map(oddsOf));
-
-// ---------- farm profile ----------
-// Gas is priced per chain at the high end, exactly as in the Kaggle
-// analysis: five transactions, each charged at the protocol's most
-// expensive chain. A flat gas figure would flatter the expensive
-// chains, so Ethereum really does cost more to farm than Base.
-const GAS_PER_TX_HIGH: Record<string, number> = {
-  Ethereum: 15, Arbitrum: 2, Base: 2, Optimism: 2, Solana: 0.05,
-  Binance: 1, Polygon: 1, Tron: 1, Avalanche: 2,
-  "Hyperliquid L1": 0.5, Monad: 0.5,
+// ------------------------------------------------------------------ price model (quad, K7/K10)
+const QUAD = [10.054909012247458, 0.18926139518787044, 0.00884283527213886];
+const quadLog = (tvl: number): number => {
+  const l = Math.log(tvl);
+  return QUAD[0] + QUAD[1] * l + QUAD[2] * l * l;
 };
-function gasTotal(p: { chains: string[] }): number {
-  let worst = 0;
-  for (const c of p.chains) worst = Math.max(worst, GAS_PER_TX_HIGH[c] ?? 5);
-  if (worst === 0) worst = 5;
-  return 5 * worst;
+const fittedMcap = (tvl: number): number => Math.exp(quadLog(tvl));
+const fittedMult = (tvl: number): number => fittedMcap(tvl) / tvl;
+const quadX = (p: Proto): number[] => { const l = Math.log(p.tvl_usd); return [1, l, l * l]; };
+const olsX = (p: Proto): number[] => [1, Math.log(p.tvl_usd)];
+
+const cal = prots.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0);
+const calY = cal.map((p) => Math.log(p.mcap_usd as number));
+// Leave-one-out residuals of the quad, refit per row.
+const looRes: number[] = [];
+for (let i = 0; i < cal.length; i++) {
+  const X = cal.filter((_, j) => j !== i).map(quadX);
+  const y = calY.filter((_, j) => j !== i);
+  const b = ols(X, y);
+  const xi = quadX(cal[i]);
+  looRes.push(calY[i] - b.reduce((s, v, k) => s + v * xi[k], 0));
 }
-const FARM = { cap: 2000, drop: 0.07, hrs: 3.5, hor: 12 };
-function farmOf(iv: number, p: { chains: string[]; tvl_usd: number }): { net: number; perh: number; v: number; be: number } {
-  const ev = iv * FARM.drop * (FARM.cap / p.tvl_usd);
-  const cost = gasTotal(p);
-  const net = ev - cost;
-  const perh = net / (FARM.hrs * (FARM.hor / 12));
-  const v = net > 25 && perh > 5 ? 2 : net > 0 ? 1 : 0;
-  return { net, perh, v, be: cost / (iv * (FARM.cap / p.tvl_usd)) };
+const looSorted = [...looRes].sort((a, b) => a - b);
+const looMiss = Math.exp(median(looRes.map(Math.abs)));
+const Q = { p10: quantile(looSorted, 0.1), p25: quantile(looSorted, 0.25), p75: quantile(looSorted, 0.75), p90: quantile(looSorted, 0.9) };
+const cov2575 = looRes.filter((r) => r >= Q.p25 && r <= Q.p75).length / looRes.length;
+const cov1090 = looRes.filter((r) => r >= Q.p10 && r <= Q.p90).length / looRes.length;
+const covX3 = looRes.filter((r) => Math.abs(r) <= Math.log(3)).length / looRes.length;
+// Walk-forward: dated calibration rows only, oldest first.
+const dated = cal.filter((p) => p.listed_at).sort((a, b) => (a.listed_at as string) < (b.listed_at as string) ? -1 : 1);
+function wfMiss(frac: number, feat: (p: Proto) => number[]): number {
+  const n = Math.floor(dated.length * frac);
+  const tr = dated.slice(0, n); const te = dated.slice(n);
+  const b = ols(tr.map(feat), tr.map((p) => Math.log(p.mcap_usd as number)));
+  const errs = te.map((p) => Math.abs(Math.log(p.mcap_usd as number) - feat(p).reduce((s, v, k) => s + v * b[k], 0)));
+  return Math.exp(median(errs));
 }
-const VERB: Record<string, string> = {
-  Lending: "Lend", Dexs: "Add liquidity to", Yield: "Deposit into the vault of",
-  "Risk Curators": "Deposit into the vault of", "Onchain Capital Allocator": "Deposit into the vault of",
+function wfMissFlat(frac: number): number {
+  const n = Math.floor(dated.length * frac);
+  const tr = dated.slice(0, n); const te = dated.slice(n);
+  const med = median(tr.map((p) => (p.mcap_usd as number) / p.tvl_usd));
+  return Math.exp(median(te.map((p) => Math.abs(Math.log(p.mcap_usd as number) - Math.log(med * p.tvl_usd)))));
+}
+const wf = {
+  quad50: wfMiss(0.5, quadX), quad70: wfMiss(0.7, quadX),
+  ols50: wfMiss(0.5, olsX), ols70: wfMiss(0.7, olsX),
+  flat50: wfMissFlat(0.5), flat70: wfMissFlat(0.7),
+  n50: dated.length - Math.floor(dated.length * 0.5),
+  n70: dated.length - Math.floor(dated.length * 0.7),
 };
-function farmSteps(p: Proto): string[] {
-  const dep = Math.round(FARM.cap * 0.7), swp = Math.round(FARM.cap * 0.15);
-  const verb = VERB[p.category ?? ""] || "Use the core product of";
-  const chain = p.chains[0] || "its main chain";
+// Negative control: quad plus the 7-day growth of the NEXT protocol by slug.
+// A feature that carries no information about this row must not help.
+const calBySlug = [...cal].sort((a, b) => (a.slug < b.slug ? -1 : 1));
+const chgVals = calBySlug.map((p) => (p.change_7d === null ? -8.23335 : p.change_7d));
+const negRes: number[] = [];
+for (let i = 0; i < calBySlug.length; i++) {
+  const X = calBySlug.filter((_, j) => j !== i).map((p, j) => {
+    const jj = j >= i ? j + 1 : j;
+    return [...quadX(p), chgVals[(jj + 1) % calBySlug.length] / 100];
+  });
+  const y = calBySlug.filter((_, j) => j !== i).map((p) => Math.log(p.mcap_usd as number));
+  const b = ols(X, y);
+  const xi = [...quadX(calBySlug[i]), chgVals[(i + 1) % calBySlug.length] / 100];
+  negRes.push(Math.log(calBySlug[i].mcap_usd as number) - b.reduce((s, v, k) => s + v * xi[k], 0));
+}
+const negMiss = Math.exp(median(negRes.map(Math.abs)));
+
+// ------------------------------------------------------------------ token odds (k-NN peer blend, K12)
+// odds = 0.6 * peer_rate + 0.4 * logistic_interaction. Peers are the 30 nearest
+// protocols in standardised [log10 TVL, log1p(age)/log1p(1095)] space, across all
+// categories; "records a token" means DefiLlama lists a gecko id, a symbol, or a
+// market cap for the protocol.
+const LOG1095 = Math.log1p(1095);
+const feat = prots.map((p) => [Math.log10(p.tvl_usd), Math.log1p(ageDays(p)) / LOG1095]);
+const fMean = [mean(feat.map((f) => f[0])), mean(feat.map((f) => f[1]))];
+const fStd = [pstdev(feat.map((f) => f[0]), fMean[0]), pstdev(feat.map((f) => f[1]), fMean[1])];
+const Z = feat.map((f) => [(f[0] - fMean[0]) / fStd[0], (f[1] - fMean[1]) / fStd[1]]);
+const BETA = [-20.94353469876965, 2.2390161109072815, 22.01291562492974, -1.515024554597611, -2.3111045361822593];
+const MED_CHG = -8.23335;
+function logistic(p: Proto): number {
+  const la = Math.log1p(ageDays(p)) / LOG1095;
+  const chg = p.change_7d === null ? MED_CHG : p.change_7d;
+  const x = [1, Math.log10(p.tvl_usd), la, chg / 100, la * Math.log10(p.tvl_usd)];
+  const z = BETA.reduce((s, b, k) => s + b * x[k], 0);
+  return 1 / (1 + Math.exp(-z));
+}
+// Nearest neighbours per protocol (self excluded), sorted by distance then index.
+interface Peer { idx: number; d: number; token: boolean; priced: boolean; }
+const peers: Peer[][] = [];
+for (let i = 0; i < N; i++) {
+  const arr: Peer[] = [];
+  for (let j = 0; j < N; j++) {
+    if (j === i) continue;
+    const dx = Z[i][0] - Z[j][0]; const dy = Z[i][1] - Z[j][1];
+    arr.push({ idx: j, d: dx * dx + dy * dy, token: hasToken(prots[j]), priced: prots[j].mcap_usd !== null && (prots[j].mcap_usd as number) > 0 });
+  }
+  arr.sort((a, b) => (a.d - b.d) || (a.idx - b.idx));
+  peers.push(arr);
+}
+const peerRate = peers.map((arr) => arr.slice(0, 30).filter((q) => q.token).length / 30);
+const odds = prots.map((p, i) => 0.6 * peerRate[i] + 0.4 * logistic(p));
+
+// ------------------------------------------------------------------ farm profile (K13)
+// Capital $2,000, drop share 7%, gas high, 5 transactions, 3.5 active hours,
+// 12-week horizon. Net = capital x fitted multiple x drop share x odds - gas.
+// Gas is the dearest chain the protocol runs on; "high" is the dearest quote.
+const GAS: Record<string, number> = {
+  Ethereum: 15, Base: 2, Arbitrum: 2, Optimism: 2, Avalanche: 2,
+  Binance: 1, Polygon: 1, Tron: 1, Hyperliquid: 0.5, 'Hyperliquid L1': 0.5,
+  Monad: 0.5, Solana: 0.05,
+};
+const gasTx = (p: Proto): number => Math.max(...p.chains.map((c) => GAS[c] ?? 5));
+const CAPITAL = 2000; const DROP = 0.07; const TXN = 5; const HOURS = 3.5;
+function farmNet(p: Proto, i: number): number {
+  return CAPITAL * fittedMult(p.tvl_usd) * DROP * odds[i] - TXN * gasTx(p);
+}
+function verdict(net: number): string {
+  if (net > 25 && net / HOURS > 5) return 'FARM';
+  if (net > 0) return 'MARGINAL';
+  return 'SKIP';
+}
+// Named plan kind, derived from the protocol's own category (never its name).
+function planKind(cat: string): string {
+  if (cat === 'Dexs') return 'liquidity and swaps';
+  if (cat === 'Lending' || cat === 'Uncollateralized Lending') return 'supply and borrow';
+  if (cat === 'CDP' || cat === 'CDP Manager') return 'mint against collateral';
+  if (cat === 'RWA') return 'tokenised asset';
+  if (cat === 'Restaking' || cat === 'Staking Pool') return 'stake and delegate';
+  return 'curated vault';
+}
+const money = (x: number): string => '$' + Math.round(x).toLocaleString('en-US');
+function farmSteps(p: Proto, i: number, kind: string, net: number): string[] {
+  const chain = p.chains[0];
+  const g = gasTx(p);
+  const gasAll = TXN * g;
+  const gross = CAPITAL * fittedMult(p.tvl_usd) * DROP * odds[i];
   return [
-    `Bridge $${dep.toLocaleString("en-US")} to ${chain} for ${p.name} (bridge fee about $6, about 15 minutes).`,
-    `${verb} $${dep.toLocaleString("en-US")} on ${chain} (deposit gas about $2, about 10 minutes).`,
-    `Swap $${swp.toLocaleString("en-US")} in and out of the protocol's main pool on ${chain} twice over 12 weeks (about $2 per swap, 5 minutes each).`,
-    `Claim and record any points or receipts the protocol issues after each action (no fee, about 5 minutes).`,
-    `Check the drop and exit: unstake and bridge back when the position is worth less than the gas to leave (exit gas about $6, about 15 minutes).`,
+    `Bridge ${money(CAPITAL)} of stablecoins to ${chain} so the plan starts where ${p.name} runs; one transaction, about ${money(g)} in gas at the protocol's dearest chain, roughly 20 minutes including confirmations.`,
+    `Deposit the ${money(CAPITAL)} into ${p.name}'s ${kind} position on ${chain}; one transaction, about ${money(g)} in gas, roughly 30 minutes to check the receipt and confirm the position shows.`,
+    `Make two swaps of $200 each through ${p.name} in weeks 2 and 6 to keep the position active; two transactions, about ${money(g)} in gas each, roughly 15 minutes of hands-on time per swap.`,
+    `Check ${p.name}'s announcements once a week for 12 weeks and write down the position address and a screenshot of the deposit; no gas, about 9 minutes a week, so the record survives even if the front end changes.`,
+    `Withdraw the ${money(CAPITAL)} plus any rewards after week 12, once the snapshot the plan is built around has passed; one transaction, about ${money(g)} in gas, roughly 20 minutes, then compare what arrives with the ${money(net)} net and ${money(gross)} gross this table shows. Total gas for the five transactions is about ${money(gasAll)}.`,
   ];
 }
 
-// ---------- board ----------
-const ledger: [string, number][] = [
-  ["Token trades, mcap > 0", 0], ["Token recorded, no usable cap", 0],
-  ["Ranked watchlist", 0], ["Ranked off-list ≥ floor", 0], ["Ranked early < floor", 0],
-  ["Bridge", 0], ["Liquid staking", 0], ["Exchange", 0], ["Versioned", 0], ["Wrapped", 0],
-];
-const ledgerIdx: Record<string, number> = {
-  Bridge: 5, "Liquid staking": 6, Exchange: 7, Versioned: 8, Wrapped: 9,
-};
-interface Row { p: Proto; iv: number; odds: number; fm: { net: number; perh: number; v: number; be: number } }
-const rows: Row[] = [];
-for (const p of snap.protocols) {
-  if (p.mcap_usd !== null && p.mcap_usd > 0) { ledger[0][1]++; continue; }
-  if (!preToken(p)) { ledger[1][1]++; continue; }
-  const ex = exclusion(p);
-  if (ex !== null) { ledger[ledgerIdx[ex]][1]++; continue; }
-  const iv = Math.max(1, Math.round(p.tvl_usd * (fittedMcap(p) / p.tvl_usd) * oddsOf(p)));
-  rows.push({ p, iv, odds: oddsOf(p), fm: farmOf(iv, p) });
-  if (watchSet.has(p.slug)) ledger[2][1]++;
-  else if (p.tvl_usd >= FLOOR) ledger[3][1]++;
-  else ledger[4][1]++;
+// ------------------------------------------------------------------ board
+interface Row {
+  slug: string; name: string; rank: number; category: string; chain: string;
+  tvl: number; chg: number | null; age: number; watch: boolean;
+  odds: number; peer: number; fitted: number; implied: number;
+  lo: number; hi: number; net: number; verdict: string;
+  be: number; pays: number; kind: string; plan: string; gas: number;
+  rankLo: number; rankHi: number; steps: string[];
+  nb: { n: string; c: string; t: number; r: number }[];
 }
-rows.sort((a, b) => b.iv - a.iv || (a.p.slug < b.p.slug ? -1 : 1));
-const r3 = (x: number, d = 4): number => {
-  const f = 10 ** d;
-  return Math.round(x * f) / f;
-};
-const dataRows = rows.map((r, i) => {
-  const p = r.p;
-  return [
-    p.slug, p.name, p.category ?? "", p.chains[0] ?? "", p.tvl_usd,
-    p.change_7d === null ? null : r3(p.change_7d, 1), r3(ageYears(p), 2), r3(r.odds, 4),
-    r.iv, Math.max(1, Math.round(r.iv * exp(Q25))), Math.max(1, Math.round(r.iv * exp(Q75))),
-    r.fm.v, Math.round(r.fm.net), r3(r.fm.perh, 1), r3(r.fm.be, 4),
-    watchSet.has(p.slug) ? 1 : 0,
-    gasTotal(p),
-  ];
+const ranked = prots.map((p, i) => ({ p, i })).filter(({ p }) => isPre(p) && exclGroup(p) === null);
+const rows: Row[] = ranked.map(({ p, i }) => {
+  const fitted = fittedMcap(p.tvl_usd);
+  const implied = fitted * odds[i];
+  const net = farmNet(p, i);
+  const mult = fitted / p.tvl_usd;
+  const kind = planKind(p.category);
+  const be = (TXN * gasTx(p)) / (CAPITAL * mult * odds[i]); // drop share at break-even
+  const pays = (TXN * gasTx(p)) / (mult * DROP * odds[i]); // smallest ticket that pays
+  const nb = peers[i].filter((q) => q.priced).slice(0, 3).map((q) => {
+    const np = prots[q.idx];
+    return { n: np.name, c: np.category, t: np.tvl_usd, r: r3((np.mcap_usd as number) / np.tvl_usd) };
+  });
+  return {
+    slug: p.slug, name: p.name, rank: 0, category: p.category, chain: p.chains[0],
+    tvl: p.tvl_usd, chg: p.change_7d, age: ageDays(p), watch: watchlist.has(p.slug),
+    odds: odds[i], peer: peerRate[i], fitted, implied,
+    lo: implied * Math.exp(Q.p25), hi: implied * Math.exp(Q.p75),
+    net, verdict: verdict(net), be, pays, kind,
+    plan: kind + ' plan on ' + p.chains[0], gas: gasTx(p),
+    rankLo: 0, rankHi: 0, steps: farmSteps(p, i, kind, net), nb,
+  };
 });
-const evidencePrice = SPECS.map((s) => [
-  s === "flat" ? "Flat multiple (median)" : s === "base" ? "log TVL" : s === "quad" ? "log TVL + quadratic" : "log TVL " + s,
-  s === "flat" ? r3(flatMiss, 2) : r3(looMiss[s], 2),
-  s === "flat" ? r3(wfFlatMiss, 2) : r3(wfMiss[s], 2),
-  keptSpecs.includes(s) ? 1 : 0,
-]);
-const RADAR = {
-  as: snap.as_of,
-  m: {
-    a: r3(priceW[0], 4), b: r3(priceW[1], 4), c: priceW.length > 2 ? r3(priceW[2], 4) : 0, loo: r3(looMiss[priceSpec], 2), wf: r3(wfMiss[priceSpec], 2),
-    flat: r3(flatMiss, 2), p10: r3(Q10, 3), p25: r3(Q25, 3), p75: r3(Q75, 3), p90: r3(Q90, 3),
-    in3: r3(inX3 * 100, 1), i2575: r3(in2575 * 100, 1), i1090: r3(in1090 * 100, 1),
-    brier: r3(brierLoo, 4), base: r3(baseRate, 3), kept: keptSpecs.length, tested: SPECS.length,
-    top: r3(topOdds, 2), young: r3(youngOdds, 2),
-  },
-  f: FARM,
-  l: ledger,
-  e: { pr: evidencePrice, od: { brier: r3(brierLoo, 4), base: r3(baseRate, 3), dec: deciles.map((d) => [r3(d[0], 2), r3(d[1], 2), r3(d[2], 2), r3(d[3], 2), d[4]]) } },
-  r: dataRows,
-};
+rows.sort((a, b) => (b.implied - a.implied) || (a.slug < b.slug ? -1 : 1));
+rows.forEach((r, k) => { r.rank = k + 1; });
+const totalImplied = rows.reduce((s, r) => s + r.implied, 0);
+const totalTvl = rows.reduce((s, r) => s + r.tvl, 0);
+const farmCounts = { FARM: 0, MARGINAL: 0, SKIP: 0 };
+rows.forEach((r) => { farmCounts[r.verdict as 'FARM' | 'MARGINAL' | 'SKIP']++; });
+const topNet = [...rows].sort((a, b) => b.net - a.net)[0];
 
-// ---------- output ----------
-mkdirSync(OUT, { recursive: true });
-mkdirSync(join(OUT, "dashboard"), { recursive: true });
-mkdirSync(join(OUT, "screenshots"), { recursive: true });
+// Bootstrap: 200 resamples of the 128 calibration rows, refit the quad, re-rank
+// the board with odds held fixed. Reports coefficient standard errors, the
+// rank range of every row, and the spread of the implied total.
+const rng = mulberry32(20261114);
+const BOOT = 200;
+const bootCoefs: number[][] = [];
+const bootTotals: number[] = [];
+const rankLoArr = rows.map(() => 999);
+const rankHiArr = rows.map(() => 0);
+const bySlug = new Map(rows.map((r) => [r.slug, r]));
+for (let b = 0; b < BOOT; b++) {
+  const idxs = Array.from({ length: cal.length }, () => Math.floor(rng() * cal.length));
+  const bc = ols(idxs.map((k) => quadX(cal[k])), idxs.map((k) => calY[k]));
+  bootCoefs.push(bc);
+  const scored = rows.map((r) => {
+    const l = Math.log(r.tvl);
+    return { slug: r.slug, imp: Math.exp(bc[0] + bc[1] * l + bc[2] * l * l) * r.odds };
+  });
+  scored.sort((a, c) => (c.imp - a.imp) || (a.slug < c.slug ? -1 : 1));
+  scored.forEach((s, k) => {
+    const rk = k + 1;
+    const j = rows.findIndex((r) => r.slug === s.slug);
+    if (rk < rankLoArr[j]) rankLoArr[j] = rk;
+    if (rk > rankHiArr[j]) rankHiArr[j] = rk;
+  });
+  bootTotals.push(scored.reduce((s, x) => s + x.imp, 0));
+}
+rows.forEach((r, k) => { r.rankLo = rankLoArr[k]; r.rankHi = rankHiArr[k]; });
+const coefSe = [0, 1, 2].map((k) => {
+  const vals = bootCoefs.map((c) => c[k]);
+  return pstdev(vals, mean(vals));
+});
+const bootTotalSorted = [...bootTotals].sort((a, b) => a - b);
+const bootTotal = { p5: quantile(bootTotalSorted, 0.05), med: quantile(bootTotalSorted, 0.5), p95: quantile(bootTotalSorted, 0.95) };
+
+// Ledger: every one of the 758 protocols in exactly one group.
+const ledger: Record<string, number> = {
+  'Token trades, mcap > 0': 0, 'Token recorded, no usable cap': 0,
+  'Ranked watchlist': 0, 'Ranked off-list >= floor': 0, 'Ranked early < floor': 0,
+  Bridge: 0, 'Liquid staking': 0, Exchange: 0, Versioned: 0, Wrapped: 0,
+};
+for (const p of prots) {
+  if (p.mcap_usd !== null && p.mcap_usd > 0) ledger['Token trades, mcap > 0']++;
+  else if (!isPre(p)) ledger['Token recorded, no usable cap']++;
+  else {
+    const g = exclGroup(p);
+    if (g === null) {
+      if (watchlist.has(p.slug)) ledger['Ranked watchlist']++;
+      else if (p.tvl_usd >= FLOOR) ledger['Ranked off-list >= floor']++;
+      else ledger['Ranked early < floor']++;
+    } else ledger[g]++;
+  }
+}
+const ledgerTotal = Object.values(ledger).reduce((s, x) => s + x, 0);
+// The record behind the odds: token rate per age bucket, from the snapshot.
+const buckets = [
+  { label: '0-1 yr', lo: 0, hi: 365 }, { label: '1-2 yr', lo: 365, hi: 730 },
+  { label: '2-3 yr', lo: 730, hi: 1095 }, { label: '3+ yr', lo: 1095, hi: 999999 },
+].map((bk) => {
+  const sub = prots.filter((p) => { const a = ageDays(p); return a >= bk.lo && a < bk.hi; });
+  return { l: bk.label, n: sub.length, r: sub.length ? sub.filter(hasToken).length / sub.length : 0 };
+});
+// Calibration scatter: priced protocols, log10 TVL and cap/TVL.
+const scatter = cal.map((p) => [Math.round(Math.log10(p.tvl_usd) * 100) / 100, r3((p.mcap_usd as number) / p.tvl_usd)]);
+
+// ------------------------------------------------------------------ evidence ladder (Kaggle K1/K7/K8/K10/K11/K12)
+// Every figure below is a held-out number from the Kaggle waves, named by wave;
+// the one live-computed row is the negative control above. Nothing here is typed
+// from memory: value rows are K1/K7/K10 leave-one-out + walk-forward misses
+// (median x), odds rows are K2/K8/K11/K12 leave-one-out Brier scores.
+const EVID_VALUE: (string | number | null)[][] = [
+  ['Size only (log TVL)', 3.40, 3.01, 3.41, 'n'],
+  ['Size + quadratic term', 3.38, 2.61, 2.82, 'k'],
+  ['Size + category', 3.45, 2.87, 2.98, 'n'],
+  ['Size + 7-day growth', 3.76, 2.74, 3.62, 'n'],
+  ['Size + age', 3.42, 2.96, 5.45, 'n'],
+  ['Size + growth + age', 3.53, 2.72, 5.80, 'n'],
+  ['Size + chain count', 3.66, 2.81, 3.28, 'n'],
+  ['Slope per category', 3.68, 2.64, 2.51, 'n'],
+  ['Quadratic + growth', 3.79, 2.55, 3.40, 'n'],
+  ['Quadratic + log-age squared', 3.56, 3.23, 34.11, 'n'],
+  ['Quadratic + category', 3.69, 2.61, 2.37, 'n'],
+  ['Cubic in log TVL', 3.56, 2.37, 3.32, 'n'],
+  ['Ridge, best alpha', 3.44, 2.60, 3.79, 'n'],
+  ['k-NN price, k=15', 4.11, 3.29, 2.86, 'n'],
+  ['Flat median multiple', 5.07, 5.29, 5.29, 'n'],
+  ["Quadratic + another row's growth", r3(negMiss), null, null, 'm'],
+];
+const EVID_ODDS: (string | number)[][] = [
+  ['Logistic interaction', 0.2254, 0.62, 0.41, 0.058, 'n'],
+  ['Logistic + category', 0.2135, 0.57, 0.07, 0.035, 'n'],
+  ['Hazard, smoothed', 0.2495, 0.51, 0.78, 0.390, 'n'],
+  ['Empirical-Bayes cells', 0.2488, 0.56, 0.52, 0.088, 'n'],
+  ['Peer rate as a logistic feature', 0.2081, 0.60, 0.19, 0.044, 'n'],
+  ['Same-category peer blend', 0.2174, 0.65, 0.35, 0.076, 'n'],
+  ['Tempered isotonic (v3 odds)', 0.2251, 0.62, 0.38, 0.032, 'n'],
+  ['k-NN peer blend k=10, m=20', 0.2192, 0.69, 0.41, 0.042, 'n'],
+  ['k-NN peer blend k=30, m=20', 0.2199, 0.69, 0.36, 0.037, 'k'],
+];
+
+// ------------------------------------------------------------------ output data
+const cats = [...new Set([...rows.map((r) => r.category), ...rows.flatMap((r) => r.nb.map((q) => q.c))])].sort();
+const chains = [...new Set(rows.map((r) => r.chain))].sort();
+const kinds = ['curated vault', 'supply and borrow', 'liquidity and swaps', 'mint against collateral', 'tokenised asset', 'stake and delegate'];
+const catIdx = (c: string): number => cats.indexOf(c);
+const chainIdx = (c: string): number => chains.indexOf(c);
+const m3 = (x: number): number => { const m = x / 1e6; return m >= 100 ? Math.round(m) : Math.round(m * 10) / 10; }; // $M, 3 significant figures
+const bySlugRow = new Map(rows.map((r) => [r.slug, r]));
+const oddOf = (slug: string): number => r3(bySlugRow.get(slug)?.odds ?? NaN);
+const mainTsHash = sha256(readFileSync(join(SCRIPT_DIR, 'main.ts')));
+const tbill12 = CAPITAL * 0.04 * (12 / 52); // stated 4.0% annual T-bill assumption
+const meta = {
+  asOf: AS_OF, n: rows.length, tvlB: r3(totalTvl / 1e9), impB: r3(totalImplied / 1e9),
+  imp: Math.round(totalImplied), tvl: totalTvl,
+  farm: [farmCounts.FARM, farmCounts.MARGINAL, farmCounts.SKIP],
+  topNet: { n: topNet.name, v: Math.round(topNet.net * 100) / 100 },
+  loo: r3(looMiss), wf50: r3(wf.quad50), wf70: r3(wf.quad70),
+  olsLoo: 3.40, olsWf50: r3(wf.ols50), olsWf70: r3(wf.ols70),
+  flatLoo: 5.07, flatWf: r3(wf.flat50),
+  cov2575: Math.round(cov2575 * 1000) / 10, cov1090: Math.round(cov1090 * 1000) / 10,
+  covX3: Math.round(covX3 * 1000) / 10,
+  q: [r3(Q.p10), r3(Q.p25), r3(Q.p75), r3(Q.p90)],
+  neg: r3(negMiss), coef: QUAD.map(r4), coefSe: coefSe.map((s) => Math.round(s * 100) / 100),
+  bootN: BOOT, bootTot: [Math.round(bootTotal.p5 / 1e6), Math.round(bootTotal.med / 1e6), Math.round(bootTotal.p95 / 1e6)],
+  brier: 0.2199, topOdds: 0.686, youngMin: 0.363, decile: 0.037, baseRate: 0.549,
+  top4: { steak: oddOf('steakhouse-financial'), gaunt: oddOf('gauntlet'), usdd: oddOf('usdd'), veda: oddOf('veda') },
+  young: { dtao: oddOf('bittensor-dtao'), nonce: oddOf('nonce-capital') },
+  ledger, ledgerTotal, buckets: buckets.map((b) => [b.l, b.n, Math.round(b.r * 1000) / 10]),
+  scatter, gas: GAS, capital: CAPITAL, drop: DROP, txn: TXN, hours: HOURS,
+  tbill: Math.round(tbill12 * 100) / 100, checksum: mainTsHash.slice(0, 16),
+  ev: EVID_VALUE, eo: EVID_ODDS,
+};
+const nbNames: string[] = [];
+const nbIdMap = new Map<string, number>();
+const nbId = (n: string): number => {
+  let id = nbIdMap.get(n);
+  if (id === undefined) { id = nbNames.length; nbNames.push(n); nbIdMap.set(n, id); }
+  return id;
+};
+const dataRows = rows.map((r) => [
+  r.name, catIdx(r.category), chainIdx(r.chain), m3(r.tvl),
+  r.chg === null ? null : Math.round(r.chg * 10) / 10, r.age,
+  r3(r.odds), r3(r.peer), m3(r.implied), Math.round(r.net),
+  r.verdict === 'FARM' ? 0 : r.verdict === 'MARGINAL' ? 1 : 2,
+  r.watch ? 1 : 0, r.rankLo, r.rankHi, kinds.indexOf(r.kind),
+  r.nb.map((q) => [nbId(q.n), catIdx(q.c), m3(q.t), q.r]), r.gas,
+]);
+// One board row per line, so a reader that stops early still sees whole rows.
+const dataJs = 'window.RADAR={"m":' + JSON.stringify(meta) + ',"cats":' + JSON.stringify(cats) +
+  ',"chains":' + JSON.stringify(chains) + ',"kinds":' + JSON.stringify(kinds) +
+  ',"nt":' + JSON.stringify(nbNames) + ',"b":[\n' +
+  dataRows.map((r) => JSON.stringify(r)).join(',\n') + '\n]};\n';
+
+// ------------------------------------------------------------------ write outputs
+mkdirSync(outDir, { recursive: true });
+mkdirSync(join(outDir, 'dashboard'), { recursive: true });
+mkdirSync(join(outDir, 'screenshots'), { recursive: true });
 const board = {
-  rows: rows.map((r, i) => ({
-    slug: r.p.slug, name: r.p.name, rank: i + 1,
-    implied_value_usd: r.iv, farm_steps: farmSteps(r.p),
+  rows: rows.map((r) => ({
+    slug: r.slug, name: r.name, rank: r.rank, category: r.category, chain: r.chain,
+    tvl_usd: r.tvl, change_7d_pct: r.chg, age_days: r.age, watchlist: r.watch,
+    token_odds: r3(r.odds), peer_rate_knn: r3(r.peer),
+    fitted_mcap_usd: Math.round(r.fitted), implied_value_usd: Math.round(r.implied),
+    range_lo_usd: Math.round(r.lo), range_hi_usd: Math.round(r.hi),
+    farm_verdict: r.verdict, farm_net_usd: Math.round(r.net * 100) / 100,
+    farm_net_per_hour_usd: Math.round((r.net / HOURS) * 100) / 100,
+    break_even_drop_share: Math.round(r.be * 1000) / 1000,
+    pays_from_usd: Math.round(r.pays),
+    plan_kind: r.kind, plan_name: r.plan, rank_lo_boot: r.rankLo, rank_hi_boot: r.rankHi,
+    farm_steps: r.steps,
   })),
 };
-writeFileSync(join(OUT, "board.json"), JSON.stringify(board, null, 1) + "\n");
-cpSync(join(ROOT, "dashboard"), join(OUT, "dashboard"), { recursive: true });
-writeFileSync(join(OUT, "dashboard", "data.js"), "window.RADAR=" + JSON.stringify(RADAR) + ";\n");
-if (existsSync(join(ROOT, "screenshots"))) cpSync(join(ROOT, "screenshots"), join(OUT, "screenshots"), { recursive: true });
-const dossier = buildDossier(OUT, {
+writeFileSync(join(outDir, 'board.json'), JSON.stringify(board, null, 2) + '\n');
+for (const f of readdirSync(join(SCRIPT_DIR, 'dashboard'))) {
+  copyFileSync(join(SCRIPT_DIR, 'dashboard', f), join(outDir, 'dashboard', f));
+}
+for (const f of readdirSync(join(SCRIPT_DIR, 'screenshots'))) {
+  copyFileSync(join(SCRIPT_DIR, 'screenshots', f), join(outDir, 'screenshots', f));
+}
+writeFileSync(join(outDir, 'dashboard', 'data.js'), dataJs);
+const dossier = buildDossier(outDir, {
   text_max_bytes: 65536,
   screenshots: { max: 4, max_bytes: 524288 },
-  dashboard: { max_files: 400, max_bytes: 4 * 1024 * 1024 },
+  dashboard: { max_files: 400, max_bytes: 4194304 },
 });
-writeFileSync(join(OUT, "dossier.json"), dossier);
-const dossierObj = JSON.parse(new TextDecoder().decode(dossier)) as { text: string };
+writeFileSync(join(outDir, 'dossier.json'), dossier);
+const dossierTextBytes = Buffer.byteLength(JSON.parse(Buffer.from(dossier).toString('utf8')).text, 'utf8');
+const runtimeMs = Date.now() - started;
 console.log(JSON.stringify({
-  rows: rows.length, tvlBoard: rows.reduce((s, r) => s + r.p.tvl_usd, 0),
-  totalImplied: rows.reduce((s, r) => s + r.iv, 0),
-  top5: rows.slice(0, 5).map((r) => [r.p.name, r.iv]),
-  ledger: ledger.map((g) => g[1]), priceSpec, priceW: priceW.map((x) => r3(x, 4)),
-  loo: r3(looMiss[priceSpec], 3), wf: r3(wfMiss[priceSpec], 3), flat: r3(flatMiss, 3),
-  brierLoo: r3(brierLoo, 4), baseRate: r3(baseRate, 3), topOdds: r3(topOdds, 3), youngOdds: r3(youngOdds, 3),
-  farmCounts: [0, 1, 2].map((v) => rows.filter((r) => r.fm.v === v).length),
-  dossierTextBytes: Buffer.byteLength(dossierObj.text, "utf8"), dossierBytes: dossier.length,
-}, null, 1));
+  outDir, rows: rows.length, totalTvl, totalImplied: Math.round(totalImplied),
+  top5: rows.slice(0, 5).map((r) => ({ n: r.name, imp: Math.round(r.implied), o: r3(r.odds) })),
+  farmCounts, topNet: { n: topNet.name, v: Math.round(topNet.net * 100) / 100 },
+  top4odds: meta.top4, young: meta.young,
+  loo: r3(looMiss), wf50: r3(wf.quad50), wf70: r3(wf.quad70),
+  cov2575: meta.cov2575, cov1090: meta.cov1090, covX3: meta.covX3, q: meta.q,
+  neg: r3(negMiss), coefSe: meta.coefSe, bootTot: meta.bootTot,
+  ledger, ledgerTotal, buckets: meta.buckets,
+  dossierBytes: dossier.length, dossierTextBytes,
+  mainTsSha256: mainTsHash, runtimeMs,
+}, null, 2));
