@@ -3,85 +3,105 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Launch Radar — pre-token protocols, valued from their own record</title>
+<title>Launch Radar v4 — quad price, k-NN peer odds, every term held out twice</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 <header class="top">
-  <div>
-    <h1>Launch Radar</h1>
-    <p class="sub">Pre-token protocols, valued from their own record. Snapshot as of 2026-11-14, source DefiLlama. "Records no token" is not a claim it has none.</p>
+  <div class="ttl">
+    <h1>Launch Radar <span class="v">v4</span></h1>
+    <p class="sub">Pre-token protocols, valued from their own record. The odds below are the peers&rsquo; record &mdash; the share of similar protocols that record a token &mdash; not a forecast, and this page never says a token will launch.</p>
+    <p class="meta" id="asof"></p>
   </div>
-  <div class="topright"><span class="dot"></span><span id="asof"></span></div>
+  <div class="hdr-note">No token means DefiLlama records none; it is not a promise one is coming. Not financial advice.</div>
 </header>
 
-<section id="kpis" class="kpis" aria-label="Key figures"></section>
+<section class="kpis" id="kpis" aria-label="headline checks"></section>
 
-<p class="formula">Implied value = TVL &times; fitted multiple &times; token odds <span id="formulaNums"></span></p>
-
-<section class="panel" id="accounting">
-  <h2>Protocol accounting — all 758 protocols, each exactly once</h2>
-  <div id="ledgerBar" class="ledgerbar"></div>
-  <div id="ledgerTable" class="ledger"></div>
+<section class="strip" id="integrity" aria-label="integrity checks">
+  <h2>Integrity strip &mdash; recomputed here, from the table below</h2>
+  <ul id="integrity-list"></ul>
 </section>
 
-<section class="panel" id="integrityPanel">
-  <h2>Integrity — recomputed from board.json when this page renders</h2>
-  <ul id="integrity" class="checks"></ul>
+<section class="audit" id="audit" aria-label="range honesty audit">
+  <h2>Range honesty audit</h2>
+  <p class="small">The ranges on every row come from leave-one-out residuals of the price fit. A printed range is a claim; here is how often the claim held on protocols the fit had not seen.</p>
+  <div class="audit-grid" id="audit-grid"></div>
 </section>
 
-<section class="panel" id="evidence">
-  <h2>Out-of-sample evidence — every term kept only if it passes two held-out tests</h2>
-  <div class="evgrid">
-    <div><h3>Value if it launches — miss (median &times;)</h3><div id="evPrice"></div></div>
-    <div><h3>Token odds — calibration by decile</h3><div id="evOdds"></div></div>
-    <div><h3>Range honesty — LOO intervals</h3><div id="evRange"></div></div>
+<section class="acct" aria-label="protocol accounting">
+  <h2>Protocol accounting &mdash; all 758, each exactly once</h2>
+  <div class="bar" id="acct-bar"></div>
+  <ul class="legend" id="acct-legend"></ul>
+</section>
+
+<section class="evidence" aria-label="held-out evidence">
+  <h2>Every term held out twice &mdash; kept only if it passes both</h2>
+  <p class="small">Leave-one-out (LOO) refits the model once per protocol and tests on the one left out; walk-forward (WF) fits on the oldest protocols and tests on the newest. A term is kept only when it beats the size-only baseline on LOO <em>and</em> on WF50. Miss is the median factor by which the fitted market cap misses the real one.</p>
+  <div class="ev-wrap">
+    <div class="ev-col">
+      <h3>Value if it launches &mdash; miss (median &times;)</h3>
+      <table id="ev-value"><thead><tr><th>Specification</th><th>LOO</th><th>WF 50/50</th><th>WF 70/30</th><th>Kept?</th></tr></thead><tbody></tbody></table>
+      <p class="small" id="coef-note"></p>
+    </div>
+    <div class="ev-col">
+      <h3>Token odds &mdash; leave-one-out</h3>
+      <table id="ev-odds"><thead><tr><th>Definition</th><th>Brier</th><th>Top</th><th>Youngest</th><th>Decile err</th><th>Kept?</th></tr></thead><tbody></tbody></table>
+      <p class="small">Brier scores the odds against what actually happened across all 758 protocols; base rate 0.549 scores 0.248. &ldquo;Top&rdquo; is the highest odds among the four largest watchlist protocols; &ldquo;youngest&rdquo; is the lowest odds among the two youngest watchlist protocols. The same-category peer blend was the K11 winner on balance and is still not kept: it crushes Steakhouse to 0.29 and Gauntlet to 0.28, the exact failure that sank v2.</p>
+    </div>
   </div>
-  <p class="fine" id="modelNote"></p>
 </section>
 
-<section class="panel" id="controls">
-  <h2>Board — 198 ranked protocols</h2>
-  <div class="ctl">
-    <label>Verdict <select id="fVerdict"><option value="">All</option><option>FARM</option><option>MARGINAL</option><option>SKIP</option></select></label>
-    <label>List <select id="fList"><option value="">All</option><option value="wl">Watchlist</option><option value="early">Early (off-list)</option></select></label>
-    <label>Category <select id="fCat"><option value="">All</option></select></label>
-    <label>Chain <select id="fChain"><option value="">All</option></select></label>
-    <label>Search <input id="fSearch" type="search" placeholder="protocol name"></label>
-    <button id="resetBtn" type="button">Reset</button>
-    <button id="csvBtn" type="button">Export CSV</button>
-    <button id="jsonBtn" type="button">Export JSON</button>
+<section class="odds-ctx" aria-label="the record behind the odds">
+  <h2>The record behind the odds</h2>
+  <div class="ctx-wrap">
+    <div>
+      <p class="small">Share of protocols that record a token, by how long they have run. Older cohorts record tokens more often; the odds model reads size and age together, never age alone.</p>
+      <table id="age-buckets"><thead><tr><th>Age bucket</th><th>Protocols</th><th>Record a token</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div>
+      <p class="small">Fitted market cap against TVL for the 128 protocols whose token trades, with the quadratic fit drawn through them. Points far from the curve are why the ranges are wide.</p>
+      <svg id="scatter" viewBox="0 0 460 300" role="img" aria-label="market cap against TVL scatter with fitted curve"></svg>
+    </div>
   </div>
-  <div class="ctl sliders">
-    <label>Plan size <input id="sCap" type="range" min="500" max="20000" step="500" value="2000"> <b id="sCapV">$2,000</b></label>
-    <label>Drop share <input id="sDrop" type="range" min="1" max="20" step="1" value="7"> <b id="sDropV">7%</b></label>
-    <label>Horizon <input id="sHor" type="range" min="4" max="52" step="4" value="12"> <b id="sHorV">12 weeks</b></label>
-    <span class="fine" id="farmAssump"></span>
-  </div>
-  <p class="fine" id="rowCount"></p>
-  <div class="tablewrap"><table id="board">
-    <thead><tr>
-      <th data-k="0">#</th><th data-k="1">Protocol</th><th data-k="2">Category</th><th data-k="3">Chain</th>
-      <th data-k="4">TVL</th><th data-k="5">7d</th><th data-k="6">Age</th><th data-k="7">Token odds</th>
-      <th data-k="8">Implied value</th><th data-k="9">Range P25–P75</th><th data-k="10">Farm verdict</th>
-    </tr></thead>
-    <tbody id="tbody"></tbody>
-  </table></div>
 </section>
 
-<section class="panel" id="detailPanel">
-  <h2>Protocol detail</h2>
-  <div id="detail"><p class="fine">Click a row in the board to see its full record, intervals and farm plan.</p></div>
+<section class="controls" aria-label="board controls">
+  <div class="ctl-row">
+    <span class="ctl-label">Verdict</span>
+    <span id="verdict-btns"></span>
+    <span class="ctl-label">List</span>
+    <select id="tier"><option value="all">All</option><option value="wl">Watchlist</option><option value="early">Early (off-list)</option></select>
+    <span class="ctl-label">Category</span><select id="cat"></select>
+    <span class="ctl-label">Chain</span><select id="chain"></select>
+    <input id="search" type="search" placeholder="Search a name" aria-label="Search a name">
+    <button id="reset">Reset</button>
+    <button id="csv">Export CSV</button>
+    <button id="json">Export JSON</button>
+  </div>
+  <div class="ctl-row sliders">
+    <label>Plan size $<input id="plan-size" type="number" value="2000" min="500" max="10000" step="500"></label>
+    <label>Drop share <input id="drop" type="range" min="5" max="10" step="1" value="7"> <span id="drop-v">7%</span></label>
+    <label>Horizon <input id="horizon" type="range" min="4" max="26" step="2" value="12"> <span id="horizon-v">12 weeks</span></label>
+    <span class="small" id="profile-note"></span>
+  </div>
 </section>
+
+<section class="board-sec" aria-label="ranked board">
+  <h2>Board &mdash; <span id="shown-count"></span></h2>
+  <p class="small">Implied value = TVL &times; fitted multiple &times; token odds. Ranks below the top two are noisy: read the range, not the rank number. Click a row for the full working.</p>
+  <table id="board"><thead><tr>
+    <th data-k="rank">#</th><th data-k="name">Protocol</th><th data-k="cat">Category</th><th data-k="chain">Chain</th>
+    <th data-k="tvl">TVL</th><th data-k="chg">7d</th><th data-k="age">Age</th><th data-k="odds">Token odds</th>
+    <th data-k="imp">Implied value</th><th>Range P25&ndash;P75</th><th data-k="net">Farm verdict</th>
+  </tr></thead><tbody id="board-body"></tbody></table>
+</section>
+
+<section class="detail" id="detail" hidden aria-label="protocol detail"></section>
 
 <footer>
-  <h2>Honesty notes</h2>
-  <ul>
-    <li>Ranks below the top two are noisy: intervals are shown, never claim rank precision.</li>
-    <li>Token odds are a fitted result, not a promise that a token launches.</li>
-    <li>A farm verdict is a statement about the stated farmer profile (capital, drop share, gas), not a fact.</li>
-    <li>Implied value follows the snapshot's own figures — TVL, 7-day growth and time running with no token recorded — never a hardcoded list of names.</li>
-  </ul>
+  <p class="small">How to read this page. The ranking is a claim about the snapshot, not about the future: the price fit misses the real market cap by a median factor of &times;3.38 on protocols it has not seen, and the odds are a fitted share, not a promise. Farm verdicts are statements about one stated farmer &mdash; $2,000 of capital, a 7% drop share, gas at the high quote, five transactions, three and a half active hours over twelve weeks &mdash; not facts about the protocol. Change the plan size or the drop share above and the verdicts move; that is the point. Nothing here is financial advice. Data: DefiLlama snapshot as of 2026-11-14; 758 protocols at or above $5,000,000 TVL; 40 on the watchlist.</p>
+  <p class="small">Method, in one paragraph. The launch price is fitted from the 128 protocols whose token already trades: log market cap is quadratic in log TVL, and it is the only price term that beat the size-only baseline on leave-one-out and on walk-forward. The odds blend the share of the 30 nearest protocols by size and age that record a token (weight 0.6) with a logistic fit on size, age, 7-day change and their interaction (weight 0.4). Ranges come from leave-one-out residuals. Farm nets are capital &times; fitted multiple &times; drop share &times; odds, minus gas.</p>
 </footer>
 <script src="data.js"></script>
 <script src="app.js"></script>
