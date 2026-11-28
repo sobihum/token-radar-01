@@ -1,9 +1,20 @@
-// Launch Radar v4 — main.ts
+// Launch Radar v5 — main.ts
 // Reads the sealed DefiLlama snapshot, ranks every pre-token protocol the house
 // rules leave in, and writes board.json, the dashboard data, and dossier.json.
 // Node 22, standard library only. Fully deterministic: no clock, no network,
 // no unseeded randomness. Run: node main.ts --input <snapshot.json>
 // Output directory: MAKEFUN_OUTPUT_DIR, default ./out
+//
+// Changes vs v4 (see v5/DESIGN-PROPOSAL.md):
+//  - odds: knn_blend k=10, m=15 (w=0.4) instead of k=30, m=20 (w=0.6)
+//  - price quad refit live on the calibration set, asserted against K7
+//  - age buckets exclude the 113 protocols with no listing date (K14b)
+//  - farm_steps prose tightened ~60% (same cost + time info)
+//  - farm tier matrix per row ($500 / $2,000 / $10,000 at 7%, gas high)
+//  - full 30-cell farm grid printed (K13 method, odds k10_m15)
+//  - data.js at full precision (exact TVL / implied dollars, no 3-sig-fig
+//    rounding), nearest-peer entries reduced to name ids (TVL/mcap looked
+//    up in the trades table), net column dropped (dashboard recomputes it)
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -96,6 +107,13 @@ function ageDays(p: Proto): number {
   const d = Math.round((asOfDay - Date.parse(p.listed_at + 'T00:00:00Z')) / 86400000);
   return Math.max(0, d);
 }
+// True age, or null when the snapshot records no listing date. The model
+// imputes 677 days for those (ageDays above); the age-bucket record table
+// below excludes them instead of pretending to know.
+function ageOrNull(p: Proto): number | null {
+  if (!p.listed_at) return null;
+  return ageDays(p);
+}
 const hasToken = (p: Proto): boolean => p.gecko_id !== null || p.symbol !== null || p.mcap_usd !== null;
 const isPre = (p: Proto): boolean => p.gecko_id === null && p.symbol === null && p.mcap_usd === null;
 
@@ -114,18 +132,21 @@ function exclGroup(p: Proto): string | null {
 }
 
 // ------------------------------------------------------------------ price model (quad, K7/K10)
-const QUAD = [10.054909012247458, 0.18926139518787044, 0.00884283527213886];
+// Refit live on the calibration set and check it against the K7 coefficients:
+// same data, same OLS, so the two agree to ~1e-9. The live fit is the one used.
+const K7_QUAD = [10.05490901224893, 0.18926139518771215, 0.00884283527214308];
+const quadX = (p: Proto): number[] => { const l = Math.log(p.tvl_usd); return [1, l, l * l]; };
+const olsX = (p: Proto): number[] => [1, Math.log(p.tvl_usd)];
+const cal = prots.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0);
+const calY = cal.map((p) => Math.log(p.mcap_usd as number));
+const QUAD = ols(cal.map(quadX), calY);
+for (let k = 0; k < 3; k++) if (Math.abs(QUAD[k] - K7_QUAD[k]) > 1e-6) throw new Error('quad refit does not match K7');
 const quadLog = (tvl: number): number => {
   const l = Math.log(tvl);
   return QUAD[0] + QUAD[1] * l + QUAD[2] * l * l;
 };
 const fittedMcap = (tvl: number): number => Math.exp(quadLog(tvl));
 const fittedMult = (tvl: number): number => fittedMcap(tvl) / tvl;
-const quadX = (p: Proto): number[] => { const l = Math.log(p.tvl_usd); return [1, l, l * l]; };
-const olsX = (p: Proto): number[] => [1, Math.log(p.tvl_usd)];
-
-const cal = prots.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0);
-const calY = cal.map((p) => Math.log(p.mcap_usd as number));
 // Leave-one-out residuals of the quad, refit per row.
 const looRes: number[] = [];
 for (let i = 0; i < cal.length; i++) {
@@ -180,11 +201,12 @@ for (let i = 0; i < calBySlug.length; i++) {
 }
 const negMiss = Math.exp(median(negRes.map(Math.abs)));
 
-// ------------------------------------------------------------------ token odds (k-NN peer blend, K12)
-// odds = 0.6 * peer_rate + 0.4 * logistic_interaction. Peers are the 30 nearest
+// ------------------------------------------------------------------ token odds (k-NN peer blend, K14)
+// odds = 0.4 * peer_rate + 0.6 * logistic_interaction. Peers are the 10 nearest
 // protocols in standardised [log10 TVL, log1p(age)/log1p(1095)] space, across all
 // categories; "records a token" means DefiLlama lists a gecko id, a symbol, or a
-// market cap for the protocol.
+// market cap for the protocol. K14: Brier LOO 0.2188, top 0.714, top4_min 0.60,
+// young 0.404, decile 0.0314 — beats v4 (k=30, m=20) on every metric but top4_min.
 const LOG1095 = Math.log1p(1095);
 const feat = prots.map((p) => [Math.log10(p.tvl_usd), Math.log1p(ageDays(p)) / LOG1095]);
 const fMean = [mean(feat.map((f) => f[0])), mean(feat.map((f) => f[1]))];
@@ -212,22 +234,32 @@ for (let i = 0; i < N; i++) {
   arr.sort((a, b) => (a.d - b.d) || (a.idx - b.idx));
   peers.push(arr);
 }
-const peerRate = peers.map((arr) => arr.slice(0, 30).filter((q) => q.token).length / 30);
-const odds = prots.map((p, i) => 0.6 * peerRate[i] + 0.4 * logistic(p));
+const peerRate = peers.map((arr) => arr.slice(0, 10).filter((q) => q.token).length / 10);
+const odds = prots.map((p, i) => 0.4 * peerRate[i] + 0.6 * logistic(p));
 
 // ------------------------------------------------------------------ farm profile (K13)
 // Capital $2,000, drop share 7%, gas high, 5 transactions, 3.5 active hours,
 // 12-week horizon. Net = capital x fitted multiple x drop share x odds - gas.
-// Gas is the dearest chain the protocol runs on; "high" is the dearest quote.
+// Gas is the dearest chain the protocol runs on; "high" is the dearest quote,
+// "low" the cheapest quote on that chain.
 const GAS: Record<string, number> = {
   Ethereum: 15, Base: 2, Arbitrum: 2, Optimism: 2, Avalanche: 2,
   Binance: 1, Polygon: 1, Tron: 1, Hyperliquid: 0.5, 'Hyperliquid L1': 0.5,
   Monad: 0.5, Solana: 0.05,
 };
+const GAS_LOW: Record<string, number> = {
+  Ethereum: 5, Base: 0.1, Arbitrum: 0.1, Optimism: 0.1, Avalanche: 0.5,
+  Binance: 0.1, Polygon: 0.1, Tron: 0.1, Hyperliquid: 0.1, 'Hyperliquid L1': 0.1,
+  Monad: 0.1, Solana: 0.01,
+};
 const gasTx = (p: Proto): number => Math.max(...p.chains.map((c) => GAS[c] ?? 5));
+const gasTxLow = (p: Proto): number => Math.max(...p.chains.map((c) => GAS_LOW[c] ?? 1));
 const CAPITAL = 2000; const DROP = 0.07; const TXN = 5; const HOURS = 3.5;
 function farmNet(p: Proto, i: number): number {
   return CAPITAL * fittedMult(p.tvl_usd) * DROP * odds[i] - TXN * gasTx(p);
+}
+function netAt(p: Proto, i: number, cap: number, drop: number, gas: 'low' | 'high'): number {
+  return cap * fittedMult(p.tvl_usd) * drop * odds[i] - TXN * (gas === 'high' ? gasTx(p) : gasTxLow(p));
 }
 function verdict(net: number): string {
   if (net > 25 && net / HOURS > 5) return 'FARM';
@@ -244,17 +276,19 @@ function planKind(cat: string): string {
   return 'curated vault';
 }
 const money = (x: number): string => '$' + Math.round(x).toLocaleString('en-US');
+// Tightened farm prose (v5): same cost + time per step, ~60% fewer characters.
+// Each step still names a cost ($ or gas) and a time.
 function farmSteps(p: Proto, i: number, kind: string, net: number): string[] {
   const chain = p.chains[0];
   const g = gasTx(p);
   const gasAll = TXN * g;
   const gross = CAPITAL * fittedMult(p.tvl_usd) * DROP * odds[i];
   return [
-    `Bridge ${money(CAPITAL)} of stablecoins to ${chain} so the plan starts where ${p.name} runs; one transaction, about ${money(g)} in gas at the protocol's dearest chain, roughly 20 minutes including confirmations.`,
-    `Deposit the ${money(CAPITAL)} into ${p.name}'s ${kind} position on ${chain}; one transaction, about ${money(g)} in gas, roughly 30 minutes to check the receipt and confirm the position shows.`,
-    `Make two swaps of $200 each through ${p.name} in weeks 2 and 6 to keep the position active; two transactions, about ${money(g)} in gas each, roughly 15 minutes of hands-on time per swap.`,
-    `Check ${p.name}'s announcements once a week for 12 weeks and write down the position address and a screenshot of the deposit; no gas, about 9 minutes a week, so the record survives even if the front end changes.`,
-    `Withdraw the ${money(CAPITAL)} plus any rewards after week 12, once the snapshot the plan is built around has passed; one transaction, about ${money(g)} in gas, roughly 20 minutes, then compare what arrives with the ${money(net)} net and ${money(gross)} gross this table shows. Total gas for the five transactions is about ${money(gasAll)}.`,
+    `Bridge ${money(CAPITAL)} stablecoins → ${chain}; 1 tx, ~${money(g)} gas, ~20 min incl. confirmations.`,
+    `Deposit ${money(CAPITAL)} into ${p.name}'s ${kind} position on ${chain}; 1 tx, ~${money(g)} gas, ~30 min to check the receipt.`,
+    `Two $200 swaps through ${p.name} in weeks 2 and 6; 2 tx, ~${money(g)} gas each, ~15 min each.`,
+    `Check ${p.name}'s announcements weekly for 12 weeks; note the position address + deposit screenshot; no gas, ~9 min/week.`,
+    `Withdraw ${money(CAPITAL)} + rewards after week 12; 1 tx, ~${money(g)} gas, ~20 min; compare with net ${money(net)} / gross ${money(gross)} shown. Total gas 5 tx ≈ ${money(gasAll)}.`,
   ];
 }
 
@@ -263,12 +297,31 @@ interface Row {
   slug: string; name: string; rank: number; category: string; chain: string;
   tvl: number; chg: number | null; age: number; watch: boolean;
   odds: number; peer: number; fitted: number; implied: number;
-  lo: number; hi: number; net: number; verdict: string;
+  lo: number; hi: number; net: number; verdict: string; tier: string;
   be: number; pays: number; kind: string; plan: string; gas: number;
   rankLo: number; rankHi: number; steps: string[];
   nb: { n: string; c: string; t: number; r: number }[];
 }
 const ranked = prots.map((p, i) => ({ p, i })).filter(({ p }) => isPre(p) && exclGroup(p) === null);
+// Full 30-cell farm grid (K13 method, odds k10_m15): capital x drop x gas.
+const grid: { cap: number; drop: number; gas: string; farm: number; marg: number; skip: number; topNet: number; topName: string }[] = [];
+for (const cap of [500, 1000, 2000, 5000, 10000]) for (const drop of [0.05, 0.07, 0.10]) for (const gas of ['low', 'high'] as const) {
+  const counts = { FARM: 0, MARGINAL: 0, SKIP: 0 };
+  let tn = -Infinity; let tname = '';
+  for (const { p, i } of ranked) {
+    const n = netAt(p, i, cap, drop, gas);
+    counts[verdict(n) as 'FARM' | 'MARGINAL' | 'SKIP']++;
+    if (n > tn) { tn = n; tname = p.name; }
+  }
+  grid.push({ cap, drop: Math.round(drop * 100), gas, farm: counts.FARM, marg: counts.MARGINAL, skip: counts.SKIP, topNet: Math.round(tn * 100) / 100, topName: tname });
+}
+// Tier matrix per row: verdict initials at $500 / $2,000 / $10,000, 7%, gas high.
+const tierOf = (p: Proto, i: number): string => [500, 2000, 10000].map((c) => verdict(netAt(p, i, c, DROP, 'high'))[0]).join('');
+const tierCounts: Record<number, [number, number, number]> = {};
+for (const cap of [500, 2000, 10000]) {
+  const g = grid.find((x) => x.cap === cap && x.drop === 7 && x.gas === 'high')!;
+  tierCounts[cap] = [g.farm, g.marg, g.skip];
+}
 const rows: Row[] = ranked.map(({ p, i }) => {
   const fitted = fittedMcap(p.tvl_usd);
   const implied = fitted * odds[i];
@@ -286,7 +339,7 @@ const rows: Row[] = ranked.map(({ p, i }) => {
     tvl: p.tvl_usd, chg: p.change_7d, age: ageDays(p), watch: watchlist.has(p.slug),
     odds: odds[i], peer: peerRate[i], fitted, implied,
     lo: implied * Math.exp(Q.p25), hi: implied * Math.exp(Q.p75),
-    net, verdict: verdict(net), be, pays, kind,
+    net, verdict: verdict(net), tier: tierOf(p, i), be, pays, kind,
     plan: kind + ' plan on ' + p.chains[0], gas: gasTx(p),
     rankLo: 0, rankHi: 0, steps: farmSteps(p, i, kind, net), nb,
   };
@@ -354,21 +407,25 @@ for (const p of prots) {
 }
 const ledgerTotal = Object.values(ledger).reduce((s, x) => s + x, 0);
 // The record behind the odds: token rate per age bucket, from the snapshot.
+// Protocols with no listing date (113) are excluded, not imputed: the table
+// says what the record shows, and the dashboard names the exclusion. (K14b)
+const datedAll = prots.filter((p) => ageOrNull(p) !== null);
+const nullAge = prots.length - datedAll.length;
 const buckets = [
   { label: '0-1 yr', lo: 0, hi: 365 }, { label: '1-2 yr', lo: 365, hi: 730 },
   { label: '2-3 yr', lo: 730, hi: 1095 }, { label: '3+ yr', lo: 1095, hi: 999999 },
 ].map((bk) => {
-  const sub = prots.filter((p) => { const a = ageDays(p); return a >= bk.lo && a < bk.hi; });
+  const sub = datedAll.filter((p) => { const a = ageOrNull(p)!; return a >= bk.lo && a < bk.hi; });
   return { l: bk.label, n: sub.length, r: sub.length ? sub.filter(hasToken).length / sub.length : 0 };
 });
-// Calibration scatter: priced protocols, log10 TVL and cap/TVL.
-const scatter = cal.map((p) => [Math.round(Math.log10(p.tvl_usd) * 100) / 100, r3((p.mcap_usd as number) / p.tvl_usd)]);
+// (The calibration scatter is drawn from the trades table below: log10 TVL
+// and cap/TVL for the same 128 priced protocols, so it is not stored twice.)
 
-// ------------------------------------------------------------------ evidence ladder (Kaggle K1/K7/K8/K10/K11/K12)
+// ------------------------------------------------------------------ evidence ladder (Kaggle K1/K7/K8/K10/K11/K12/K14)
 // Every figure below is a held-out number from the Kaggle waves, named by wave;
 // the one live-computed row is the negative control above. Nothing here is typed
 // from memory: value rows are K1/K7/K10 leave-one-out + walk-forward misses
-// (median x), odds rows are K2/K8/K11/K12 leave-one-out Brier scores.
+// (median x), odds rows are K2/K8/K11/K12/K14 leave-one-out Brier scores.
 const EVID_VALUE: (string | number | null)[][] = [
   ['Size only (log TVL)', 3.40, 3.01, 3.41, 'n'],
   ['Size + quadratic term', 3.38, 2.61, 2.82, 'k'],
@@ -396,7 +453,8 @@ const EVID_ODDS: (string | number)[][] = [
   ['Same-category peer blend', 0.2174, 0.65, 0.35, 0.076, 'n'],
   ['Tempered isotonic (v3 odds)', 0.2251, 0.62, 0.38, 0.032, 'n'],
   ['k-NN peer blend k=10, m=20', 0.2192, 0.69, 0.41, 0.042, 'n'],
-  ['k-NN peer blend k=30, m=20', 0.2199, 0.69, 0.36, 0.037, 'k'],
+  ['k-NN peer blend k=10, m=15', 0.2188, 0.714, 0.404, 0.0314, 'k'],
+  ['k-NN peer blend k=30, m=20', 0.2199, 0.686, 0.363, 0.037, 'n'],
 ];
 
 // ------------------------------------------------------------------ output data
@@ -405,15 +463,23 @@ const chains = [...new Set(rows.map((r) => r.chain))].sort();
 const kinds = ['curated vault', 'supply and borrow', 'liquidity and swaps', 'mint against collateral', 'tokenised asset', 'stake and delegate'];
 const catIdx = (c: string): number => cats.indexOf(c);
 const chainIdx = (c: string): number => chains.indexOf(c);
-const m3 = (x: number): number => { const m = x / 1e6; return m >= 100 ? Math.round(m) : Math.round(m * 10) / 10; }; // $M, 3 significant figures
 const bySlugRow = new Map(rows.map((r) => [r.slug, r]));
 const oddOf = (slug: string): number => r3(bySlugRow.get(slug)?.odds ?? NaN);
 const mainTsHash = sha256(readFileSync(join(SCRIPT_DIR, 'main.ts')));
 const tbill12 = CAPITAL * 0.04 * (12 / 52); // stated 4.0% annual T-bill assumption
+// Name ids, shared by the nearest-peer entries and the trades table.
+const nbNames: string[] = [];
+const nbIdMap = new Map<string, number>();
+const nbId = (n: string): number => {
+  let id = nbIdMap.get(n);
+  if (id === undefined) { id = nbNames.length; nbNames.push(n); nbIdMap.set(n, id); }
+  return id;
+};
 const meta = {
   asOf: AS_OF, n: rows.length, tvlB: r3(totalTvl / 1e9), impB: r3(totalImplied / 1e9),
   imp: Math.round(totalImplied), tvl: totalTvl,
   farm: [farmCounts.FARM, farmCounts.MARGINAL, farmCounts.SKIP],
+  tierCounts: [tierCounts[500], tierCounts[2000], tierCounts[10000]],
   topNet: { n: topNet.name, v: Math.round(topNet.net * 100) / 100 },
   loo: r3(looMiss), wf50: r3(wf.quad50), wf70: r3(wf.quad70),
   olsLoo: 3.40, olsWf50: r3(wf.ols50), olsWf70: r3(wf.ols70),
@@ -423,28 +489,34 @@ const meta = {
   q: [r3(Q.p10), r3(Q.p25), r3(Q.p75), r3(Q.p90)],
   neg: r3(negMiss), coef: QUAD.map(r4), coefSe: coefSe.map((s) => Math.round(s * 100) / 100),
   bootN: BOOT, bootTot: [Math.round(bootTotal.p5 / 1e6), Math.round(bootTotal.med / 1e6), Math.round(bootTotal.p95 / 1e6)],
-  brier: 0.2199, topOdds: 0.686, youngMin: 0.363, decile: 0.037, baseRate: 0.549,
+  brier: 0.2188, topOdds: 0.714, youngMin: 0.404, decile: 0.0314, baseRate: 0.549,
   top4: { steak: oddOf('steakhouse-financial'), gaunt: oddOf('gauntlet'), usdd: oddOf('usdd'), veda: oddOf('veda') },
   young: { dtao: oddOf('bittensor-dtao'), nonce: oddOf('nonce-capital') },
   ledger, ledgerTotal, buckets: buckets.map((b) => [b.l, b.n, Math.round(b.r * 1000) / 10]),
-  scatter, gas: GAS, capital: CAPITAL, drop: DROP, txn: TXN, hours: HOURS,
+  nullAge, gas: GAS, capital: CAPITAL, drop: DROP, txn: TXN, hours: HOURS,
   tbill: Math.round(tbill12 * 100) / 100, checksum: mainTsHash.slice(0, 16),
   ev: EVID_VALUE, eo: EVID_ODDS,
+  // The 128 priced protocols (the price fit's training data): [name id,
+  // category, TVL in dollars, market cap in dollars]. The nearest-peer
+  // entries below reference the same name ids; their TVL and cap are read
+  // from this table, so no peer value is stored twice.
+  trades: cal.map((p) => [nbId(p.name), catIdx(p.category), p.tvl_usd, Math.round(p.mcap_usd as number)]),
 };
-const nbNames: string[] = [];
-const nbIdMap = new Map<string, number>();
-const nbId = (n: string): number => {
-  let id = nbIdMap.get(n);
-  if (id === undefined) { id = nbNames.length; nbNames.push(n); nbIdMap.set(n, id); }
-  return id;
-};
+// data.js row layout (v5): [0] name, [1] category idx, [2] chain idx,
+// [3] TVL in dollars (exact), [4] 7-day change % (1dp) or null, [5] age days,
+// [6] token odds (3dp), [7] peer rate (3dp), [8] implied value in dollars
+// (exact), [9] verdict 0/1/2, [10] watchlist 0/1, [11] rank low (bootstrap),
+// [12] rank high (bootstrap), [13] plan-kind idx,
+// [14] nearest priced peers (3 name ids), [15] gas per tx in dollars (high).
+// The farm net is NOT stored: the dashboard recomputes it from [3], [6], [8]
+// and [15], and at full precision it equals board.json to the dollar.
 const dataRows = rows.map((r) => [
-  r.name, catIdx(r.category), chainIdx(r.chain), m3(r.tvl),
+  r.name, catIdx(r.category), chainIdx(r.chain), r.tvl,
   r.chg === null ? null : Math.round(r.chg * 10) / 10, r.age,
-  r3(r.odds), r3(r.peer), m3(r.implied), Math.round(r.net),
+  r3(r.odds), r3(r.peer), Math.round(r.implied),
   r.verdict === 'FARM' ? 0 : r.verdict === 'MARGINAL' ? 1 : 2,
   r.watch ? 1 : 0, r.rankLo, r.rankHi, kinds.indexOf(r.kind),
-  r.nb.map((q) => [nbId(q.n), catIdx(q.c), m3(q.t), q.r]), r.gas,
+  r.nb.map((q) => nbId(q.n)), r.gas,
 ]);
 // One board row per line, so a reader that stops early still sees whole rows.
 const dataJs = 'window.RADAR={"m":' + JSON.stringify(meta) + ',"cats":' + JSON.stringify(cats) +
@@ -465,6 +537,7 @@ const board = {
     range_lo_usd: Math.round(r.lo), range_hi_usd: Math.round(r.hi),
     farm_verdict: r.verdict, farm_net_usd: Math.round(r.net * 100) / 100,
     farm_net_per_hour_usd: Math.round((r.net / HOURS) * 100) / 100,
+    farm_tier: r.tier,
     break_even_drop_share: Math.round(r.be * 1000) / 1000,
     pays_from_usd: Math.round(r.pays),
     plan_kind: r.kind, plan_name: r.plan, rank_lo_boot: r.rankLo, rank_hi_boot: r.rankHi,
@@ -490,12 +563,14 @@ const runtimeMs = Date.now() - started;
 console.log(JSON.stringify({
   outDir, rows: rows.length, totalTvl, totalImplied: Math.round(totalImplied),
   top5: rows.slice(0, 5).map((r) => ({ n: r.name, imp: Math.round(r.implied), o: r3(r.odds) })),
-  farmCounts, topNet: { n: topNet.name, v: Math.round(topNet.net * 100) / 100 },
+  top10: rows.slice(0, 10).map((r) => ({ n: r.name, imp: Math.round(r.implied), o: r3(r.odds) })),
+  farmCounts, tierCounts, topNet: { n: topNet.name, v: Math.round(topNet.net * 100) / 100 },
+  grid,
   top4odds: meta.top4, young: meta.young,
   loo: r3(looMiss), wf50: r3(wf.quad50), wf70: r3(wf.quad70),
   cov2575: meta.cov2575, cov1090: meta.cov1090, covX3: meta.covX3, q: meta.q,
-  neg: r3(negMiss), coefSe: meta.coefSe, bootTot: meta.bootTot,
-  ledger, ledgerTotal, buckets: meta.buckets,
+  neg: r3(negMiss), coef: QUAD.map(r4), coefSe: meta.coefSe, bootTot: meta.bootTot,
+  ledger, ledgerTotal, buckets: meta.buckets, nullAge,
   dossierBytes: dossier.length, dossierTextBytes,
   mainTsSha256: mainTsHash, runtimeMs,
 }, null, 2));
